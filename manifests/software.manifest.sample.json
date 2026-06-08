@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "2.0",
+  "packages": [
+    {
+      "name": "7zip",
+      "version": "24.09",
+      "installerPath": "packages/7zip/24.09/7z2409-x64.exe",
+      "sha256": "REPLACE_WITH_SHA256",
+      "packageType": "exe-silent",
+      "installerArgs": [],
+      "rebootRequired": false
+    },
+    {
+      "name": "notepadplusplus",
+      "version": "8.7.6",
+      "installerPath": "packages/notepadplusplus/8.7.6/npp.8.7.6.Installer.x64.exe",
+      "sha256": "REPLACE_WITH_SHA256",
+      "packageType": "exe-silent",
+      "installerArgs": [],
+      "rebootRequired": false
+    },
+    {
+      "name": "sysmon",
+      "version": "15.15.1",
+      "installerPath": "Sysmon.exe",
+      "sha256": "16E4ED3EA1D4C67213799905D61A2722CF08A0B74A885E58B743B91D3CDDFC87",
+      "packageType": "exe-args",
+      "installerArgs": [
+        "/accepteula",
+        "/i",
+        "sysmonconfig.xml"
+      ],
+      "configSha256": "9032DBD4232EF4483FB3431BA2D2BFD924F3332253B4A25D7AE471FDCAC10341",
+      "rebootRequired": false
+    }
+  ]
+}

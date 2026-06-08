@@ -1,0 +1,211 @@
+# Deployment Guide
+
+## 1. Prerequisites
+
+- Azure subscription with permissions for compute, network, storage, and guest configuration assignment operations.
+- GitHub repository with Actions enabled.
+- OIDC federation from GitHub Actions to Azure.
+- Azure CLI available in runner (provided in GitHub-hosted runners).
+
+## 2. Configure GitHub Secrets
+
+Set these repository secrets:
+
+- AZURE_CLIENT_ID
+- AZURE_TENANT_ID
+- AZURE_SUBSCRIPTION_ID
+- MANIFEST_SIGNING_PUBLIC_KEY_PEM — ECDSA P-256 public key used for signature verification in CI/package build/runtime.
+- STORAGE_ACCOUNT_NAME — Azure Storage account name
+- BLOB_CONTAINER_NAME — Container for Machine Configuration packages
+- INSTALLER_CONTAINER_NAME — Container for installer binaries
+
+The GitHub OIDC service principal needs data-plane roles on the storage account used by this solution.
+
+Required roles:
+
+- Storage Blob Data Contributor (for Machine Configuration package upload to `machine-configuration-packages`)
+
+Example role assignment scope:
+
+```bash
+/subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>/providers/Microsoft.Storage/storageAccounts/<STORAGE_ACCOUNT_NAME>
+```
+
+## 3. Prepare App Manifest
+
+Copy manifests/software.manifest.sample.json to manifests/software.manifest.json and update entries.
+
+For a full step-by-step onboarding runbook (including allowlist approval, signing, validation, and troubleshooting), see [ADD-NEW-SOFTWARE.md](ADD-NEW-SOFTWARE.md).
+
+Each package entry needs:
+
+- name
+- version
+- installerPath (path inside the `software-repo` Blob container)
+- sha256 (64-char hash of installer)
+- packageType (`exe-silent`, `msi-silent`, `exe-args`, or `msi-args`)
+- installerArgs (array of arguments for `exe-args`/`msi-args` package types)
+- configSha256 (optional 64-char hash of companion config file; when changed, machine configuration reapplies even if version is unchanged)
+- verifyPath (optional path to an executable to confirm successful installation)
+
+Example:
+
+```json
+{
+  "schemaVersion": "2.0",
+  "packages": [
+    {
+      "name": "7zip",
+      "version": "26.00",
+      "installerPath": "packages/7zip/26.00/7z2600-x64.exe",
+      "sha256": "<sha256>",
+      "packageType": "exe-silent",
+      "installerArgs": [],
+      "verifyPath": "C:\\Program Files\\7-Zip\\7z.exe",
+      "rebootRequired": false
+    }
+  ]
+}
+```
+
+Upload installer binaries to the `software-repo` Blob container using the same path layout referenced by `installerPath`.
+
+## 4. Deploy Infrastructure
+
+Create the required storage containers manually using the Azure CLI. Authenticate first with `az login`, then:
+
+```bash
+az storage container create \
+  --name software-repo \
+  --account-name <STORAGE_ACCOUNT_NAME> \
+  --auth-mode login
+
+az storage container create \
+  --name machine-configuration-packages \
+  --account-name <STORAGE_ACCOUNT_NAME> \
+  --auth-mode login
+```
+
+Omitting `--auth-mode login` causes the CLI to fall back to querying the account key, which triggers a credentials warning. Use `--auth-mode login` to authenticate with your Entra identity instead.
+
+Also create any other required resources (VM, networking, etc.) through the Azure portal or your preferred IaC tooling.
+
+## 5. Upload Software And Extract File Hash
+
+Download software to local machine.  
+Run cmd: `Get-FileHash ./software.exe -Algorithm SHA256`.  
+Add software details to Manifest.  
+
+If you are adding a new app for the first time, follow [ADD-NEW-SOFTWARE.md](ADD-NEW-SOFTWARE.md) first to update the allowlist and re-sign required files.
+
+## 6. Package And Deploy With Azure Policy
+
+The direct Assign Machine Configuration workflow has been removed. Deployment is Azure Policy only.
+
+Run workflow Build And Publish Machine Configuration Package.
+
+Required inputs:
+
+- applicationName
+
+Optional inputs:
+
+- applicationVersion
+
+Then run workflow Get Policy Values with the same app/version inputs.
+
+Storage account name and container names are configured as repository secrets (`STORAGE_ACCOUNT_NAME`, `BLOB_CONTAINER_NAME`, `INSTALLER_CONTAINER_NAME`) and are not workflow inputs.
+
+The workflows use short-lived, HTTPS-only, IP-scoped user delegation SAS tokens for CI storage operations. The runner outbound public IPv4 is detected at runtime and used in SAS IP restrictions. Target machines still download package and installer content with managed identity.
+
+What the workflows do:
+
+1. Validate manifest structure.
+2. Verify ECDSA-P256-SHA256 signatures on the manifest and package allowlist.
+3. Resolve the selected app entry from manifest.
+4. Validate installer blob exists in the `software-repo` Blob container.
+5. Build and publish a custom Machine Configuration package (`AuditAndSet`).
+6. Read package metadata (`contentHash`, `packageName`) from blob storage.
+7. Generate a ready-to-use policy definition payload artifact.
+
+Deploy with Azure Policy:
+
+1. Create or update policy definition from the artifact generated by Get Policy Values.
+2. Create or update policy assignment at target scope (management group, subscription, or resource group).
+3. Tag each machine that should receive the application.
+4. Monitor compliance in Azure Policy.
+
+## Targeting machines with tags
+
+The generated policy only applies to machines that carry the tag:
+
+| Tag name | Tag value |
+| --- | --- |
+| `MachineConfiguration` | `<app-name>` (e.g. `7zip`) |
+
+Machines without the tag are evaluated as non-applicable and left untouched.
+
+Tag an Azure VM:
+
+```bash
+az vm update \
+  --resource-group <RESOURCE_GROUP> \
+  --name <VM_NAME> \
+  --set tags.MachineConfiguration=<app-name>
+```
+
+Tag an Azure Arc-enabled machine:
+
+```bash
+az connectedmachine update \
+  --resource-group <RESOURCE_GROUP> \
+  --name <MACHINE_NAME> \
+  --tags MachineConfiguration=<app-name>
+```
+
+A machine can receive multiple applications by creating one policy definition + assignment per application, each with its own tag value. There is no limit to how many `MachineConfiguration` tag values a machine can hold — each policy checks its own value independently.
+
+Example commands:
+
+```bash
+# Create or update the policy definition using the full ARM envelope from the workflow artifact.
+az rest \
+  --method put \
+  --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<MANAGEMENT_GROUP>/providers/Microsoft.Authorization/policyDefinitions/Install-<app-name>?api-version=2021-06-01" \
+  --body @<app-name>-machine-configuration-policy.json \
+  --headers "Content-Type=application/json"
+
+az policy assignment create \
+  --name Install-<app-name> \
+  --display-name Install-<app-name> \
+  --policy Install-<app-name> \
+  --scope /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>
+```
+
+## 7. Scale Strategy For Hundreds Of Machines
+
+- Use separate policy assignments for rollout rings (canary, pilot, broad).
+- Roll out by scope progression (resource group to subscription to management group).
+- Use assignment exclusions (`notScopes`) and tag-based targeting where appropriate.
+- Re-run Build And Publish and Get Policy Values per application/version, then update policy definition and assignment.
+
+## 8. Network And Access Requirements On Machines
+
+Installer retrieval uses an HTTPS URL pointing to the `software-repo` Blob container:
+
+```text
+https://<storage-account>.blob.core.windows.net/software-repo/<installerPath>
+```
+
+Machines must be able to:
+
+- Resolve `<storage-account>.blob.core.windows.net`
+- Reach TCP 443 outbound
+- Use a managed identity with `Storage Blob Data Reader` to download package and installer blobs
+
+Quick checks from a target machine:
+
+```powershell
+Resolve-DnsName <storage-account>.blob.core.windows.net
+Test-NetConnection <storage-account>.blob.core.windows.net -Port 443
+```

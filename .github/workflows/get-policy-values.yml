@@ -1,0 +1,386 @@
+name: Get Policy Values
+
+on:
+  workflow_dispatch:
+    inputs:
+      applicationName:
+        description: Application name in manifests/software.manifest.json
+        required: true
+        default: 7zip
+      applicationVersion:
+        description: Optional explicit application version from manifest
+        required: false
+
+env:
+  STORAGE_ACCOUNT_NAME: ${{ secrets.STORAGE_ACCOUNT_NAME }}
+  BLOB_CONTAINER_NAME: ${{ secrets.BLOB_CONTAINER_NAME }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  get_policy_values:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+
+      - name: Azure login
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 #v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Select manifest source
+        id: select_manifest
+        shell: pwsh
+        run: |
+          $manifestSource = 'manifests/software.manifest.json'
+          if (-not (Test-Path -Path $manifestSource)) {
+            $manifestSource = 'manifests/software.manifest.sample.json'
+          }
+          "manifest_source=$manifestSource" >> $env:GITHUB_OUTPUT
+
+      - name: Install policy generation module
+        # Must use PS 5.1 to align with GuestConfiguration module behavior used in other workflows.
+        shell: powershell
+        run: |
+          Install-Module -Name GuestConfiguration -RequiredVersion 4.11.0 -Scope CurrentUser -Force -AllowClobber
+
+      - name: Resolve app entry from manifest
+        id: resolve_app
+        shell: pwsh
+        env:
+          INPUT_APP_NAME: ${{ inputs.applicationName }}
+          INPUT_APP_VERSION: ${{ inputs.applicationVersion }}
+        run: |
+          $manifestPath = "${{ steps.select_manifest.outputs.manifest_source }}"
+          $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+
+          $appName = $env:INPUT_APP_NAME
+          $appVersion = $env:INPUT_APP_VERSION
+
+          $packages = @($manifest.packages | Where-Object { ([string]$_.name) -ieq $appName })
+          if ($packages.Count -eq 0) {
+            throw "Application '$appName' was not found in $manifestPath"
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($appVersion)) {
+            $packages = @($packages | Where-Object { ([string]$_.version) -eq $appVersion })
+            if ($packages.Count -eq 0) {
+              throw "Application '$appName' with version '$appVersion' was not found in $manifestPath"
+            }
+          }
+
+          if ($packages.Count -gt 1) {
+            throw "Manifest contains multiple entries for '$appName'. Pass applicationVersion to disambiguate."
+          }
+
+          $selected = $packages[0]
+          "app_name=$([string]$selected.name)" >> $env:GITHUB_OUTPUT
+          "app_version=$([string]$selected.version)" >> $env:GITHUB_OUTPUT
+
+      - name: Detect runner outbound IPv4
+        id: runner_ip
+        shell: pwsh
+        run: |
+          $ipServices = @(
+            'https://api.ipify.org?format=text',
+            'https://ipv4.icanhazip.com'
+          )
+
+          $detectedIps = @()
+          foreach ($service in $ipServices) {
+            try {
+              $response = (Invoke-RestMethod -Uri $service -Method Get -TimeoutSec 15).ToString().Trim()
+              if ($response -match '^(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])){3}$') {
+                $detectedIps += $response
+              }
+            }
+            catch {
+              Write-Warning "Failed outbound IP query against $service. Error: $($_.Exception.Message)"
+            }
+          }
+
+          $uniqueIps = @($detectedIps | Select-Object -Unique)
+          if ($uniqueIps.Count -eq 0) {
+            throw 'Unable to resolve runner outbound IPv4 address.'
+          }
+
+          if ($uniqueIps.Count -gt 1) {
+            throw "Runner outbound IPv4 mismatch detected across IP services: $($uniqueIps -join ', ')"
+          }
+
+          "runner_ipv4=$($uniqueIps[0])" >> $env:GITHUB_OUTPUT
+
+      - name: Read blob metadata
+        id: policy_values
+        shell: pwsh
+        env:
+          INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
+          INPUT_BLOB_CONTAINER: ${{ env.BLOB_CONTAINER_NAME }}
+        run: |
+          $appName = "${{ steps.resolve_app.outputs.app_name }}"
+          $appVersion = "${{ steps.resolve_app.outputs.app_version }}"
+          $blobName = "packages/$appName/$appVersion/mc-$appName.zip"
+
+          $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(10).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+          $blobReadSas = az storage blob generate-sas `
+            --as-user `
+            --auth-mode login `
+            --account-name $env:INPUT_STORAGE_ACCOUNT `
+            --container-name $env:INPUT_BLOB_CONTAINER `
+            --name "$blobName" `
+            --permissions r `
+            --start $startTime `
+            --expiry $expiryTime `
+            --https-only `
+            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --output tsv
+
+          $blobReadSas = [string]$blobReadSas
+          if ([string]::IsNullOrWhiteSpace($blobReadSas)) {
+            throw "Failed to generate read SAS token for blob '$blobName'."
+          }
+
+          Write-Output "::add-mask::$blobReadSas"
+
+          $env:AZURE_STORAGE_SAS_TOKEN = $blobReadSas
+
+          try {
+            $exists = az storage blob exists `
+              --account-name $env:INPUT_STORAGE_ACCOUNT `
+              --container-name $env:INPUT_BLOB_CONTAINER `
+              --name "$blobName" `
+              --query "exists" `
+              --output tsv
+
+            if ($exists.Trim() -ne 'true') {
+              throw "Package blob '$blobName' not found. Run the Build And Publish Package workflow first."
+            }
+
+            # Read contentHash from blob metadata set by the build workflow.
+            # Note: az storage blob show returns metadata at the top-level 'metadata' key, not under 'properties'.
+            $metaJson = az storage blob show `
+              --account-name $env:INPUT_STORAGE_ACCOUNT `
+              --container-name $env:INPUT_BLOB_CONTAINER `
+              --name "$blobName" `
+              --query "metadata" `
+              --output json
+          }
+          finally {
+            Remove-Item -Path Env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+            $blobReadSas = [string]::Empty
+          }
+
+          $meta = $metaJson | ConvertFrom-Json
+          # Azure Blob Storage lowercases metadata keys, so use case-insensitive lookup.
+          $contentHash = [string]($meta.PSObject.Properties | Where-Object { $_.Name -ieq 'contentHash' } | Select-Object -ExpandProperty Value -First 1)
+          $packageName = [string]($meta.PSObject.Properties | Where-Object { $_.Name -ieq 'packageName' } | Select-Object -ExpandProperty Value -First 1)
+
+          if ([string]::IsNullOrWhiteSpace($contentHash)) {
+            throw "contentHash metadata is missing from blob '$blobName'. Re-run the Build And Publish Package workflow to repopulate it."
+          }
+          if ([string]::IsNullOrWhiteSpace($packageName)) {
+            throw "packageName metadata is missing from blob '$blobName'. Re-run the Build And Publish Package workflow to repopulate it."
+          }
+
+          $contentUri = "https://$($env:INPUT_STORAGE_ACCOUNT).blob.core.windows.net/$($env:INPUT_BLOB_CONTAINER)/$blobName"
+
+          "content_hash=$contentHash" >> $env:GITHUB_OUTPUT
+          "content_uri=$contentUri" >> $env:GITHUB_OUTPUT
+          "package_name=$packageName" >> $env:GITHUB_OUTPUT
+          "blob_name=$blobName" >> $env:GITHUB_OUTPUT
+
+      - name: Download prebuilt package blob for policy generation
+        id: download_package
+        shell: pwsh
+        env:
+          INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
+          INPUT_BLOB_CONTAINER: ${{ env.BLOB_CONTAINER_NAME }}
+        run: |
+          # This workflow does not build or publish packages.
+          # It only downloads the already-published package so New-GuestConfigurationPolicy
+          # can generate a policy JSON configured for system-assigned managed identity.
+          $blobName = "${{ steps.policy_values.outputs.blob_name }}"
+          $packagePath = Join-Path $env:RUNNER_TEMP "${{ steps.policy_values.outputs.package_name }}.zip"
+
+          $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(10).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+          $blobReadSas = az storage blob generate-sas `
+            --as-user `
+            --auth-mode login `
+            --account-name $env:INPUT_STORAGE_ACCOUNT `
+            --container-name $env:INPUT_BLOB_CONTAINER `
+            --name "$blobName" `
+            --permissions r `
+            --start $startTime `
+            --expiry $expiryTime `
+            --https-only `
+            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --output tsv
+
+          $blobReadSas = [string]$blobReadSas
+          if ([string]::IsNullOrWhiteSpace($blobReadSas)) {
+            throw "Failed to generate read SAS token for blob '$blobName'."
+          }
+
+          Write-Output "::add-mask::$blobReadSas"
+
+          $env:AZURE_STORAGE_SAS_TOKEN = $blobReadSas
+
+          try {
+            az storage blob download `
+              --account-name $env:INPUT_STORAGE_ACCOUNT `
+              --container-name $env:INPUT_BLOB_CONTAINER `
+              --name "$blobName" `
+              --file "$packagePath" `
+              --output none
+          }
+          finally {
+            Remove-Item -Path Env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+            $blobReadSas = [string]::Empty
+          }
+
+          if (-not (Test-Path -Path $packagePath)) {
+            throw "Package blob '$blobName' download failed. Expected local file '$packagePath'."
+          }
+
+          "package_path=$packagePath" >> $env:GITHUB_OUTPUT
+
+      - name: Generate ready-to-use policy JSON
+        id: generate_policy
+        shell: powershell
+        run: |
+          $appName    = "${{ steps.resolve_app.outputs.app_name }}"
+          $appVersion = "${{ steps.resolve_app.outputs.app_version }}"
+          $contentUri = "${{ steps.policy_values.outputs.content_uri }}"
+          $localPackagePath = "${{ steps.download_package.outputs.package_path }}"
+
+          Import-Module GuestConfiguration -ErrorAction Stop
+
+          $policyOutputDir = Join-Path $env:RUNNER_TEMP "policy-$appName-$appVersion"
+          New-Item -Path $policyOutputDir -ItemType Directory -Force | Out-Null
+
+          # Use a deterministic policy name derived from the app name so the ARM resource
+          # name is stable and human-readable across re-runs (e.g. "Install-7zip").
+          # New-GuestConfigurationPolicy requires a GUID for PolicyId, so we derive one
+          # deterministically from the name using a SHA-256-based namespace UUID (v5-style).
+          $policyDefinitionName = "Install-$appName"
+          $nameBytes = [System.Text.Encoding]::UTF8.GetBytes($policyDefinitionName.ToLowerInvariant())
+          $sha = [System.Security.Cryptography.SHA256]::Create()
+          try { $hashBytes = $sha.ComputeHash($nameBytes) } finally { $sha.Dispose() }
+          # Use first 16 bytes to form a version-5-style UUID (set version=5, variant=2).
+          $guidBytes = [byte[]]$hashBytes[0..15]
+          $guidBytes[6] = ($guidBytes[6] -band 0x0F) -bor 0x50
+          $guidBytes[8] = ($guidBytes[8] -band 0x3F) -bor 0x80
+          $deterministicGuid = [System.Guid]::new($guidBytes).ToString()
+
+          $policyParams = @{
+            PolicyId = $deterministicGuid
+            ContentUri = $contentUri
+            DisplayName = "Install-$appName"
+            Description = "Guest Configuration policy for $appName"
+            Path = $policyOutputDir
+            Platform = 'Windows'
+            PolicyVersion = '1.0.0'
+            Mode = 'ApplyAndAutoCorrect'
+            LocalContentPath = $localPackagePath
+          }
+
+          New-GuestConfigurationPolicy @policyParams -UseSystemAssignedIdentity | Out-Null
+
+          $generatedPolicies = @(Get-ChildItem -Path $policyOutputDir -Recurse -File -Filter '*.json')
+          $generatedPath = $null
+
+          foreach ($candidate in $generatedPolicies) {
+            try {
+              $candidateJson = Get-Content -Path $candidate.FullName -Raw | ConvertFrom-Json -ErrorAction Stop
+            }
+            catch {
+              continue
+            }
+
+            $effect = [string]($candidateJson.properties.policyRule.then.effect)
+            if ($effect -ieq 'DeployIfNotExists') {
+              $generatedPath = $candidate.FullName
+              break
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($generatedPath)) {
+            $fileList = if ($generatedPolicies.Count -gt 0) {
+              ($generatedPolicies | Select-Object -ExpandProperty FullName) -join '; '
+            }
+            else {
+              '<none>'
+            }
+            throw "Could not locate generated DeployIfNotExists policy JSON under '$policyOutputDir'. JSON files found: $fileList"
+          }
+
+          Write-Host "Using generated policy file: $generatedPath"
+          Write-Host "Policy definition name (use in az rest URI): $policyDefinitionName"
+
+          $outputPath = "$appName-machine-configuration-policy.json"
+          $generatedDoc = Get-Content -Path $generatedPath -Raw | ConvertFrom-Json
+
+          # az rest --method put requires the full ARM envelope with a top-level "name"
+          # matching the URI segment. Stamp the deterministic name explicitly so the body
+          # and URI are always consistent.
+          $policyPayload = if ($null -ne $generatedDoc.PSObject.Properties['properties']) {
+            $generatedDoc
+          }
+          else {
+            [pscustomobject]@{ properties = $generatedDoc }
+          }
+          # Overwrite name with the human-readable definition name to match the az rest URI.
+          if ($null -ne $policyPayload.PSObject.Properties['name']) {
+            $policyPayload.name = $policyDefinitionName
+          }
+          else {
+            $policyPayload | Add-Member -NotePropertyName 'name' -NotePropertyValue $policyDefinitionName -Force
+          }
+
+          $policyPayload | ConvertTo-Json -Depth 50 | Set-Content -Path $outputPath -Encoding UTF8
+
+          $policyJson = Get-Content -Path $outputPath -Raw
+          if ($policyJson -notmatch '"contentManagedIdentity"') {
+            throw "Generated policy '$outputPath' does not include guestConfiguration.contentManagedIdentity."
+          }
+
+          "output_path=$outputPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload policy JSON artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a #v7.0.1
+        with:
+          name: ${{ steps.resolve_app.outputs.app_name }}-machine-configuration-policy
+          path: ${{ steps.generate_policy.outputs.output_path }}
+          retention-days: 7
+
+      - name: Write job summary
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## Policy JSON for ${{ steps.resolve_app.outputs.app_name }} ${{ steps.resolve_app.outputs.app_version }}
+
+          A ready-to-use policy JSON configured for **system-assigned managed identity** package download has been uploaded as a workflow artifact.
+          This workflow does **not** build or publish packages; it only generates policy JSON from a package already published by the Build And Publish workflow.
+          The artifact contains the **full ARM policy definition envelope** ready for `az rest`.
+          Download it from the **Artifacts** section above and use it when creating or updating your policy definition.
+
+          To apply the policy definition via CLI:
+          ``````powershell
+          az rest \`
+            --method put \`
+            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/Install-${{ steps.resolve_app.outputs.app_name }}?api-version=2021-06-01" \`
+            --body @${{ steps.resolve_app.outputs.app_name }}-machine-configuration-policy.json \`
+            --headers "Content-Type=application/json"
+          ``````
+          "@
+
+          $summary >> $env:GITHUB_STEP_SUMMARY

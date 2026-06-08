@@ -1,0 +1,428 @@
+name: Build And Publish Machine Configuration Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      applicationName:
+        description: Application name in manifests/software.manifest.json
+        required: true
+        default: 7zip
+      applicationVersion:
+        description: Optional explicit application version from manifest
+        required: false
+
+env:
+  STORAGE_ACCOUNT_NAME: ${{ secrets.STORAGE_ACCOUNT_NAME }}
+  BLOB_CONTAINER_NAME: ${{ secrets.BLOB_CONTAINER_NAME }}
+  INSTALLER_CONTAINER_NAME: ${{ secrets.INSTALLER_CONTAINER_NAME }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build_and_publish:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd #v6.0.2
+
+      - name: Azure login
+        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 #v3.0.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare Azure CLI extensions
+        shell: pwsh
+        run: |
+          az extension add --name resource-graph --version 2.1.1 --upgrade --only-show-errors
+          az extension add --name guestconfig --version 0.1.1 --upgrade --only-show-errors
+
+      - name: Select manifest source
+        id: select_manifest
+        shell: pwsh
+        run: |
+          $manifestSource = 'manifests/software.manifest.json'
+          if (-not (Test-Path -Path $manifestSource)) {
+            $manifestSource = 'manifests/software.manifest.sample.json'
+          }
+
+          "manifest_source=$manifestSource" >> $env:GITHUB_OUTPUT
+
+      - name: Install packaging modules
+        # Must use PS 5.1 (shell: powershell) so modules are installed into the
+        # WindowsPowerShell\Modules path consumed by the 'Build Machine Configuration
+        # package' step below. PS 7 (pwsh) uses a separate module path and the
+        # GuestConfiguration cmdlets would not be found at build time.
+        shell: powershell
+        run: |
+          Install-Module -Name PSDscResources -RequiredVersion 2.12.0.0 -Scope CurrentUser -Force -AllowClobber
+          Install-Module -Name GuestConfiguration -RequiredVersion 4.11.0 -Scope CurrentUser -Force -AllowClobber
+
+      - name: Validate manifest structure
+        shell: pwsh
+        run: |
+          ./scripts/Validate-Manifest.ps1 -ManifestPath "${{ steps.select_manifest.outputs.manifest_source }}"
+
+      - name: Verify manifest signature
+        shell: pwsh
+        env:
+          MANIFEST_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_PUBLIC_KEY_PEM }}
+        run: |
+          $publicKey = ConvertTo-SecureString -String $env:MANIFEST_SIGNING_PUBLIC_KEY_PEM -AsPlainText -Force
+          ./scripts/signing/Verify-Manifest.ps1 `
+            -ManifestPath "${{ steps.select_manifest.outputs.manifest_source }}" `
+            -PublicKeyPem $publicKey
+
+      - name: Verify allowlist signature
+        shell: pwsh
+        env:
+          MANIFEST_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_PUBLIC_KEY_PEM }}
+        run: |
+          $publicKey = ConvertTo-SecureString -String $env:MANIFEST_SIGNING_PUBLIC_KEY_PEM -AsPlainText -Force
+          ./scripts/signing/Verify-Manifest.ps1 `
+            -ManifestPath "scripts/installers/package-allowlist.json" `
+            -PublicKeyPem $publicKey `
+            -SignaturePath "scripts/installers/package-allowlist.json.sig"
+
+      - name: Resolve app entry from manifest
+        shell: pwsh
+        id: resolve_app
+        env:
+          INPUT_APP_NAME: ${{ inputs.applicationName }}
+          INPUT_APP_VERSION: ${{ inputs.applicationVersion }}
+        run: |
+          $manifestPath = "${{ steps.select_manifest.outputs.manifest_source }}"
+          $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
+
+          $appName = $env:INPUT_APP_NAME
+          $appVersion = $env:INPUT_APP_VERSION
+
+          $packages = @($manifest.packages | Where-Object { ([string]$_.name) -ieq $appName })
+          if ($packages.Count -eq 0) {
+            throw "Application '$appName' was not found in $manifestPath"
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace($appVersion)) {
+            $packages = @($packages | Where-Object { ([string]$_.version) -eq $appVersion })
+            if ($packages.Count -eq 0) {
+              throw "Application '$appName' with version '$appVersion' was not found in $manifestPath"
+            }
+          }
+
+          if ($packages.Count -gt 1) {
+            throw "Manifest contains multiple entries for '$appName'. Pass applicationVersion to disambiguate."
+          }
+
+          $selected = $packages[0]
+          $relativeInstallerPath = ([string]$selected.installerPath).Replace('\\', '/').TrimStart('/')
+          $installerBlobPath = $relativeInstallerPath
+          $configSha256Property = $selected.PSObject.Properties['configSha256']
+          $configSha256 = if ($null -eq $configSha256Property) { '' } else { [string]$configSha256Property.Value }
+
+          # Validate packageType is in the allowed set.
+          $packageType = [string]$selected.packageType
+          $allowedTypes = @('exe-silent', 'msi-silent', 'exe-args', 'msi-args')
+          if ($packageType -notin $allowedTypes) {
+            throw "packageType '$packageType' for '$appName' is not in the allowed set: $($allowedTypes -join ', ')"
+          }
+
+          # Validate installer arguments contain only safe characters, no whitespace.
+          $safeArgPattern = '^[a-zA-Z0-9/\\\\\-_\.=:]{1,256}$'
+          $installerArgsRaw = $selected.PSObject.Properties['installerArgs']
+          $installerArgs = if ($null -ne $installerArgsRaw) { @($installerArgsRaw.Value) } else { @() }
+          foreach ($arg in $installerArgs) {
+            if ($arg -notmatch $safeArgPattern) {
+              throw "InstallerArg '$arg' contains disallowed characters."
+            }
+          }
+
+          $installerArgsJson = if ($installerArgs.Count -gt 0) {
+            $installerArgs | ConvertTo-Json -Compress
+          } else {
+            '[]'
+          }
+          $installerArgsB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($installerArgsJson))
+
+          "app_name=$([string]$selected.name)" >> $env:GITHUB_OUTPUT
+          "app_version=$([string]$selected.version)" >> $env:GITHUB_OUTPUT
+          "installer_blob_path=$installerBlobPath" >> $env:GITHUB_OUTPUT
+          "installer_sha256=$([string]$selected.sha256)" >> $env:GITHUB_OUTPUT
+          "config_sha256=$configSha256" >> $env:GITHUB_OUTPUT
+          "package_type=$packageType" >> $env:GITHUB_OUTPUT
+          "installer_args_b64=$installerArgsB64" >> $env:GITHUB_OUTPUT
+
+          $verifyPath = if ($null -ne $selected.PSObject.Properties['verifyPath']) { [string]$selected.verifyPath } else { '' }
+          "verify_path=$verifyPath" >> $env:GITHUB_OUTPUT
+
+          $rebootRequired = if ($null -ne $selected.PSObject.Properties['rebootRequired']) { [bool]$selected.rebootRequired } else { $false }
+          "reboot_required=$rebootRequired" >> $env:GITHUB_OUTPUT
+
+      - name: Detect runner outbound IPv4
+        id: runner_ip
+        shell: pwsh
+        run: |
+          $ipServices = @(
+            'https://api.ipify.org?format=text',
+            'https://ipv4.icanhazip.com'
+          )
+
+          $detectedIps = @()
+          foreach ($service in $ipServices) {
+            try {
+              $response = (Invoke-RestMethod -Uri $service -Method Get -TimeoutSec 15).ToString().Trim()
+              if ($response -match '^(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])){3}$') {
+                $detectedIps += $response
+              }
+            }
+            catch {
+              Write-Warning "Failed outbound IP query against $service. Error: $($_.Exception.Message)"
+            }
+          }
+
+          $uniqueIps = @($detectedIps | Select-Object -Unique)
+          if ($uniqueIps.Count -eq 0) {
+            throw 'Unable to resolve runner outbound IPv4 address.'
+          }
+
+          if ($uniqueIps.Count -gt 1) {
+            throw "Runner outbound IPv4 mismatch detected across IP services: $($uniqueIps -join ', ')"
+          }
+
+          "runner_ipv4=$($uniqueIps[0])" >> $env:GITHUB_OUTPUT
+
+      - name: Validate installer exists in blob storage
+        shell: pwsh
+        env:
+          INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
+          INPUT_INSTALLER_CONTAINER: ${{ env.INSTALLER_CONTAINER_NAME }}
+        run: |
+          $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(10).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+          $installerReadSas = az storage container generate-sas `
+            --as-user `
+            --auth-mode login `
+            --account-name $env:INPUT_STORAGE_ACCOUNT `
+            --name $env:INPUT_INSTALLER_CONTAINER `
+            --permissions rl `
+            --start $startTime `
+            --expiry $expiryTime `
+            --https-only `
+            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --output tsv
+
+          $installerReadSas = [string]$installerReadSas
+          if ([string]::IsNullOrWhiteSpace($installerReadSas)) {
+            throw 'Failed to generate installer container SAS token.'
+          }
+
+          Write-Output "::add-mask::$installerReadSas"
+
+          $installerReadSasSecure = ConvertTo-SecureString -String $installerReadSas -AsPlainText -Force
+
+          ./scripts/Validate-Manifest.ps1 `
+            -ManifestPath "${{ steps.select_manifest.outputs.manifest_source }}" `
+            -StorageAccountName $env:INPUT_STORAGE_ACCOUNT `
+            -ContainerName $env:INPUT_INSTALLER_CONTAINER `
+            -AuthMode sas `
+            -SasToken $installerReadSasSecure `
+            -CheckBlobPaths
+
+          $installerReadSas = [string]::Empty
+
+      - name: Construct installer URL
+        shell: pwsh
+        id: installer_sas
+        env:
+          INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
+          INPUT_INSTALLER_CONTAINER: ${{ env.INSTALLER_CONTAINER_NAME }}
+        run: |
+          $installerUri = "https://$($env:INPUT_STORAGE_ACCOUNT).blob.core.windows.net/$($env:INPUT_INSTALLER_CONTAINER)/${{ steps.resolve_app.outputs.installer_blob_path }}"
+          "installer_uri=$installerUri" >> $env:GITHUB_OUTPUT
+
+      - name: Build Machine Configuration package
+        # Must use PS 5.1 (shell: powershell). New-GuestConfigurationPackage relies on
+        # WMI/CIM and the DSC engine, which only function correctly under Windows
+        # PowerShell 5.1. Running this step under PS 7 (pwsh) produces incomplete or
+        # broken MOF content.
+        shell: powershell
+        id: build_package
+        run: |
+          $installerArgsJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${{ steps.resolve_app.outputs.installer_args_b64 }}"))
+          $installerArgs = $installerArgsJson | ConvertFrom-Json
+
+          $packageParams = @{
+            ApplicationName = "${{ steps.resolve_app.outputs.app_name }}"
+            ApplicationVersion = "${{ steps.resolve_app.outputs.app_version }}"
+            InstallerPath = "${{ steps.installer_sas.outputs.installer_uri }}"
+            InstallerSha256 = "${{ steps.resolve_app.outputs.installer_sha256 }}"
+            InstallerType = "${{ steps.resolve_app.outputs.package_type }}"
+            InstallerArgs = $installerArgs
+            AllowlistPreVerified = $true
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace("${{ steps.resolve_app.outputs.config_sha256 }}")) {
+            $packageParams.ConfigSha256 = "${{ steps.resolve_app.outputs.config_sha256 }}"
+          }
+
+          if (-not [string]::IsNullOrWhiteSpace("${{ steps.resolve_app.outputs.verify_path }}")) {
+            $packageParams.VerifyPath = "${{ steps.resolve_app.outputs.verify_path }}"
+          }
+
+          if ('${{ steps.resolve_app.outputs.reboot_required }}' -eq 'True') {
+            $packageParams.RebootRequired = $true
+          }
+
+          $packageOutput = ./scripts/machine-configuration/New-AppMachineConfigurationPackage.ps1 @packageParams | Out-String
+
+          $jsonLine = ($packageOutput -split "`r?`n" | Where-Object {
+            $line = $_.Trim()
+            $line.StartsWith('{') -and $line.EndsWith('}')
+          } | Select-Object -Last 1)
+
+          if ([string]::IsNullOrWhiteSpace($jsonLine)) {
+            throw "Package script did not return a JSON line. Output: $packageOutput"
+          }
+
+          $package = $jsonLine | ConvertFrom-Json
+
+          "package_name=$($package.packageName)" >> $env:GITHUB_OUTPUT
+          "package_version=$($package.packageVersion)" >> $env:GITHUB_OUTPUT
+          "package_path=$($package.packagePath)" >> $env:GITHUB_OUTPUT
+          "content_hash=$($package.contentHash)" >> $env:GITHUB_OUTPUT
+
+      - name: Validate package structure and contents
+        shell: pwsh
+        run: |
+          $packagePath = "${{ steps.build_package.outputs.package_path }}"
+          $packageDir = Split-Path -Path $packagePath -Parent
+
+          Write-Host "=== Package Structure ==="
+          Get-ChildItem -Path $packageDir -Recurse | ForEach-Object { Write-Host $_.FullName }
+
+          $tempExtract = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), "gc_package_inspect_$(Get-Random)")
+          New-Item -Path $tempExtract -ItemType Directory -Force | Out-Null
+
+          Write-Host "=== Extracting package for inspection ==="
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($packagePath, $tempExtract)
+
+          Write-Host "=== Package Contents ==="
+          Get-ChildItem -Path $tempExtract -Recurse | Select-Object -ExpandProperty FullName | ForEach-Object {
+            $relativePath = $_.Substring($tempExtract.Length + 1)
+            Write-Host $relativePath
+          }
+
+          Write-Host "=== Checking for MOF files ==="
+          $mofFiles = @(Get-ChildItem -Path $tempExtract -Filter "*.mof" -Recurse)
+          if ($mofFiles.Count -eq 0) {
+            throw "No MOF files found in package. Package must contain at least one .mof file."
+          }
+          Write-Host "Found $($mofFiles.Count) MOF file(s)"
+
+          Write-Host "=== Checking for metaconfig files ==="
+          $metaConfigFiles = @(Get-ChildItem -Path $tempExtract -Filter "*.metaconfig.json" -Recurse)
+          Write-Host "Found $($metaConfigFiles.Count) metaconfig file(s)"
+          if ($metaConfigFiles.Count -eq 0) {
+            throw "No metaconfig files found in package."
+          }
+
+          Write-Host "=== Validating metaconfig category ==="
+          foreach ($metaFile in $metaConfigFiles) {
+            $meta = Get-Content -Path $metaFile.FullName -Raw | ConvertFrom-Json
+            $category = [string]$meta.category
+            Write-Host "Metaconfig $($metaFile.Name): category='$category'"
+            if ($category -ine 'Custom') {
+              throw "Metaconfig category must be 'Custom' but found '$category' in $($metaFile.FullName)"
+            }
+          }
+
+          Write-Host "=== Checking for checksums ==="
+          $checksumFiles = @(Get-ChildItem -Path $tempExtract -Filter "*.checksum" -Recurse)
+          Write-Host "Found $($checksumFiles.Count) checksum file(s)"
+
+          Write-Host "=== MOF Files (names only — content suppressed to prevent SAS token leakage) ==="
+          $mofFiles | ForEach-Object {
+            Write-Host "File: $($_.FullName -replace [regex]::Escape($tempExtract), '')"
+          }
+
+          Remove-Item -Path $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+
+      - name: Upload package to blob storage
+        shell: pwsh
+        id: upload_package
+        env:
+          INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
+          INPUT_BLOB_CONTAINER: ${{ env.BLOB_CONTAINER_NAME }}
+        run: |
+          $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
+          $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(15).ToString('yyyy-MM-ddTHH:mm:ssZ')
+
+          $packageUploadSas = az storage container generate-sas `
+            --as-user `
+            --auth-mode login `
+            --account-name $env:INPUT_STORAGE_ACCOUNT `
+            --name $env:INPUT_BLOB_CONTAINER `
+            --permissions cw `
+            --start $startTime `
+            --expiry $expiryTime `
+            --https-only `
+            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --output tsv
+
+          $packageUploadSas = [string]$packageUploadSas
+          if ([string]::IsNullOrWhiteSpace($packageUploadSas)) {
+            throw 'Failed to generate package upload SAS token.'
+          }
+
+          Write-Output "::add-mask::$packageUploadSas"
+
+          $env:AZURE_STORAGE_SAS_TOKEN = $packageUploadSas
+
+          $packageFile = Split-Path -Path "${{ steps.build_package.outputs.package_path }}" -Leaf
+          $blobPath = "packages/${{ steps.resolve_app.outputs.app_name }}/${{ steps.resolve_app.outputs.app_version }}/$packageFile"
+
+          try {
+            az storage blob upload `
+              --account-name $env:INPUT_STORAGE_ACCOUNT `
+              --container-name $env:INPUT_BLOB_CONTAINER `
+              --name "$blobPath" `
+              --file "${{ steps.build_package.outputs.package_path }}" `
+              --overwrite true `
+              --metadata contentHash="${{ steps.build_package.outputs.content_hash }}" packageName="${{ steps.build_package.outputs.package_name }}" packageVersion="${{ steps.build_package.outputs.package_version }}" `
+              --output none
+          }
+          finally {
+            Remove-Item -Path Env:AZURE_STORAGE_SAS_TOKEN -ErrorAction SilentlyContinue
+            $packageUploadSas = [string]::Empty
+          }
+
+          if ([string]::IsNullOrWhiteSpace($blobPath)) {
+            throw 'Blob path resolved to an empty value.'
+          }
+
+          $contentUri = "https://$($env:INPUT_STORAGE_ACCOUNT).blob.core.windows.net/$($env:INPUT_BLOB_CONTAINER)/$blobPath"
+          "content_uri=$contentUri" >> $env:GITHUB_OUTPUT
+          "blob_path=$blobPath" >> $env:GITHUB_OUTPUT
+
+      - name: Write job summary
+        if: success()
+        shell: pwsh
+        run: |
+          $summary = @"
+          ## Package Published
+
+          | Field          | Value |
+          |----------------|-------|
+          | Application    | ${{ steps.resolve_app.outputs.app_name }} |
+          | Version        | ${{ steps.resolve_app.outputs.app_version }} |
+          | Package name   | ${{ steps.build_package.outputs.package_name }} |
+          | Content hash   | ${{ steps.build_package.outputs.content_hash }} |
+          | Blob path      | ${{ steps.upload_package.outputs.blob_path }} |
+
+          The package is published. Run the **Get Policy Values** workflow to generate the Azure Policy definition, then deploy it with Azure Policy.
+          "@
+
+          $summary >> $env:GITHUB_STEP_SUMMARY

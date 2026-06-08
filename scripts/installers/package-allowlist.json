@@ -1,0 +1,14 @@
+{
+  "allowedPackages": [
+    "7zip",
+    "notepadplusplus",
+    "sysmon",
+    "vmwaretools"
+  ],
+  "allowedPackageTypes": [
+    "exe-silent",
+    "msi-silent",
+    "exe-args",
+    "msi-args"
+  ]
+}

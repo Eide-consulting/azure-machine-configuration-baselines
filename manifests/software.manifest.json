@@ -1,0 +1,55 @@
+{
+  "schemaVersion": "2.0",
+  "packages": [
+    {
+      "name": "7zip",
+      "version": "26.00",
+      "installerPath": "7z2600-x64.exe",
+      "sha256": "6fe18d5b3080e39678cabfa6cef12cfb25086377389b803a36a3c43236a8a82c",
+      "packageType": "exe-silent",
+      "installerArgs": [],
+      "verifyPath": "C:\\Program Files\\7-Zip\\7z.exe",
+      "rebootRequired": false
+    },
+    {
+      "name": "notepadplusplus",
+      "version": "8.0",
+      "installerPath": "npp.8.0.Installer.x64.exe",
+      "sha256": "20309AC329EA5AF92A561176BC522555EB0C277F5A4321B003A3E2DE2A31CB25",
+      "packageType": "exe-silent",
+      "installerArgs": [],
+      "verifyPath": "C:\\Program Files\\Notepad++\\notepad++.exe",
+      "rebootRequired": false
+    },
+    {
+      "name": "notepadplusplus",
+      "version": "8.9.3",
+      "installerPath": "npp.8.9.3.Installer.x64.exe",
+      "sha256": "8db87a458551371e911bea5243840c783b5e7d41b7f867a2a6f74971881fb1e4",
+      "packageType": "exe-silent",
+      "installerArgs": [],
+      "verifyPath": "C:\\Program Files\\Notepad++\\notepad++.exe",
+      "rebootRequired": false
+    },
+    {
+      "name": "sysmon",
+      "version": "15.15.1",
+      "installerPath": "Sysmon.exe",
+      "sha256": "16E4ED3EA1D4C67213799905D61A2722CF08A0B74A885E58B743B91D3CDDFC87",
+      "packageType": "exe-args",
+      "installerArgs": ["/accepteula", "/i", "sysmonconfig.xml"],
+      "configSha256": "9032DBD4232EF4483FB3431BA2D2BFD924F3332253B4A25D7AE471FDCAC10341",
+      "rebootRequired": false
+    },
+    {
+      "name": "vmwaretools",
+      "version": "13.0.5.0",
+      "installerPath": "VMware-Tools-windows-13.0.5.0.exe",
+      "sha256": "54753F73574B710D297CEA99796183001C1D1790F8500FC16BFBB8B70B6D51AB",
+      "packageType": "exe-args",
+      "installerArgs": ["/S", "/v/qn"],
+      "verifyPath": "C:\\Program Files\\VMware\\VMware Tools\\vmtoolsd.exe",
+      "rebootRequired": true
+    }
+  ]
+}
