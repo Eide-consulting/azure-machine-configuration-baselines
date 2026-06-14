@@ -13,6 +13,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# Single source of truth for MI token acquisition (handles Azure VM IMDS and the
+# Azure Arc 401 challenge-response handshake). Keep this in sync with the copy the
+# package builder injects into the DSC SetScript by editing scripts/lib only.
+. (Join-Path -Path $PSScriptRoot -ChildPath '..\lib\Get-MiAccessToken.ps1')
+
 function Write-Result {
     param([string]$Label, [bool]$Ok, [string]$Detail = '')
     $status = if ($Ok) { 'PASS' } else { 'FAIL' }
@@ -22,17 +27,9 @@ function Write-Result {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Detect VM type and resolve IMDS token endpoint
+# 1. Detect VM type (display only; the handshake selection is done in the helper)
 # ---------------------------------------------------------------------------
-if (-not [string]::IsNullOrWhiteSpace($env:IDENTITY_ENDPOINT)) {
-    $tokenUrl  = "$($env:IDENTITY_ENDPOINT)?api-version=2020-06-01&resource=https://storage.azure.com/"
-    $vmType    = 'Azure Arc'
-    $extraHeaders = @{ Metadata = 'true' }
-} else {
-    $tokenUrl  = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/'
-    $vmType    = 'Azure VM'
-    $extraHeaders = @{ Metadata = 'true' }
-}
+$vmType = if (-not [string]::IsNullOrWhiteSpace($env:IDENTITY_ENDPOINT)) { 'Azure Arc' } else { 'Azure VM' }
 Write-Host "Detected machine type : $vmType"
 Write-Host "Storage account       : $StorageAccountName"
 Write-Host ''
@@ -41,11 +38,8 @@ Write-Host ''
 # 2. Acquire MI token
 # ---------------------------------------------------------------------------
 try {
-    $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Headers $extraHeaders -Method Get
-    $token = $tokenResponse.access_token
-    if ([string]::IsNullOrWhiteSpace($token)) { throw 'access_token is empty.' }
-    $expiry = [System.DateTimeOffset]::FromUnixTimeSeconds([long]$tokenResponse.expires_on).ToLocalTime()
-    Write-Result 'Acquire MI token' $true "expires $expiry"
+    $token = Get-MiAccessToken -Resource 'https://storage.azure.com/'
+    Write-Result 'Acquire MI token' $true
 } catch {
     Write-Result 'Acquire MI token' $false $_.Exception.Message
     Write-Host ''
