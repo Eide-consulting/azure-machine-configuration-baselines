@@ -21,12 +21,16 @@ function Get-MiAccessToken {
         [string]$Resource
     )
 
+    # URL-encode the resource once so reserved characters can't produce an
+    # invalid request or inject extra query parameters.
+    $encodedResource = [System.Uri]::EscapeDataString($Resource)
+
     # Branch on IDENTITY_ENDPOINT (set by the Azure Connected Machine Agent):
     #   set   -> Azure Arc  -> 401 challenge-response handshake
     #   unset -> Azure VM    -> IMDS single-GET
     if ([string]::IsNullOrWhiteSpace($env:IDENTITY_ENDPOINT)) {
         # --- Azure VM (IMDS) -------------------------------------------------
-        $tokenUrl = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$Resource"
+        $tokenUrl = "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=$encodedResource"
         $tokenResponse = Invoke-RestMethod -Uri $tokenUrl -Headers @{ Metadata = 'true' } -Method Get
         $accessToken = $tokenResponse.access_token
         if ([string]::IsNullOrWhiteSpace($accessToken)) {
@@ -36,7 +40,7 @@ function Get-MiAccessToken {
     }
 
     # --- Azure Arc (HIMDS challenge-response) --------------------------------
-    $tokenUrl = "$($env:IDENTITY_ENDPOINT)?api-version=2020-06-01&resource=$Resource"
+    $tokenUrl = "$($env:IDENTITY_ENDPOINT)?api-version=2020-06-01&resource=$encodedResource"
 
     # Step 1: the first GET is EXPECTED to return 401. On Arc the 401 is not an
     # error -- it is step one of the protocol and carries the challenge header.
@@ -124,8 +128,12 @@ function Get-MiAccessToken {
     }
 
     # Step 5: complete the handshake. The secret and the token are credentials --
-    # never log either of them.
-    $secret = Get-Content -Path $resolvedSecretPath -Raw -ErrorAction Stop
+    # never log either of them. Trim surrounding whitespace/newlines: a trailing
+    # CR/LF (common in text files) in the header value would corrupt the request.
+    $secret = (Get-Content -Path $resolvedSecretPath -Raw -ErrorAction Stop).Trim()
+    if ([string]::IsNullOrWhiteSpace($secret)) {
+        throw 'Azure Arc secret file was empty; cannot complete the challenge-response handshake.'
+    }
     $authenticatedHeaders = @{
         Metadata      = 'true'
         Authorization = "Basic $secret"
