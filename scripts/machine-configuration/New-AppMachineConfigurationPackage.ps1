@@ -254,6 +254,16 @@ $installerArgsJsonLiteral = $rawArgsJson.Replace("'", "''")
 $verifyPathLiteral = if ([string]::IsNullOrWhiteSpace($VerifyPath)) { '' } else { $VerifyPath.Replace("'", "''") }
 $rebootRequiredLiteral = if ($RebootRequired) { 'True' } else { 'False' }
 
+# Load the single source-of-truth MI token helper. Its body is injected verbatim
+# into the generated DSC SetScript (replacing the '#__MI_HELPER__#' placeholder)
+# so the on-node code handles both Azure VM IMDS and the Azure Arc challenge-
+# response handshake. A missing helper is a build-blocking error.
+$miHelperPath = Join-Path -Path $PSScriptRoot -ChildPath '..\lib\Get-MiAccessToken.ps1'
+if (-not (Test-Path -Path $miHelperPath)) {
+    throw "Managed Identity token helper not found at '$miHelperPath'. Cannot build a package without the Arc-aware token acquisition logic."
+}
+$miHelperBody = Get-Content -Path $miHelperPath -Raw
+
 $configurationScript = @"
 configuration $configName {
     Import-DscResource -ModuleName PSDscResources
@@ -352,6 +362,7 @@ configuration $configName {
             }
 
             SetScript = {
+                #__MI_HELPER__#
                 `$installer = '$installerPathLiteral'
                 `$expectedHash = '$installerHashLiteral'
                 `$expectedConfigHash = '$configHashLiteral'
@@ -375,19 +386,9 @@ configuration $configName {
 
                     `$localInstaller = Join-Path -Path `$downloadDir -ChildPath `$fileName
 
-                    # Acquire a Managed Identity bearer token for Azure Storage.
-                    # IDENTITY_ENDPOINT is set by the Azure Connected Machine Agent on Arc machines;
-                    # fall back to the standard Azure VM IMDS endpoint otherwise.
-                    if (-not [string]::IsNullOrWhiteSpace(`$env:IDENTITY_ENDPOINT)) {
-                        `$tokenUrl = "`$(`$env:IDENTITY_ENDPOINT)?api-version=2020-06-01&resource=https://storage.azure.com/"
-                    } else {
-                        `$tokenUrl = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/'
-                    }
-                    `$tokenResponse = Invoke-RestMethod -Uri `$tokenUrl -Headers @{ Metadata = 'true' } -Method Get
-                    `$bearerToken = `$tokenResponse.access_token
-                    if ([string]::IsNullOrWhiteSpace(`$bearerToken)) {
-                        throw 'Failed to acquire Managed Identity token for Azure Storage.'
-                    }
+                    # Acquire a Managed Identity bearer token for Azure Storage. Get-MiAccessToken
+                    # handles both Azure VM (IMDS single-GET) and Azure Arc (401 challenge-response).
+                    `$bearerToken = Get-MiAccessToken -Resource 'https://storage.azure.com/'
 
                     `$downloadHeaders = @{
                         Authorization  = "Bearer `$bearerToken"
@@ -444,16 +445,7 @@ configuration $configName {
 
                             # Acquire a fresh MI token for the companion download (token acquired per
                             # download to avoid expiry if the installer takes a long time to run).
-                            if (-not [string]::IsNullOrWhiteSpace(`$env:IDENTITY_ENDPOINT)) {
-                                `$companionTokenUrl = "`$(`$env:IDENTITY_ENDPOINT)?api-version=2020-06-01&resource=https://storage.azure.com/"
-                            } else {
-                                `$companionTokenUrl = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/'
-                            }
-                            `$companionTokenResponse = Invoke-RestMethod -Uri `$companionTokenUrl -Headers @{ Metadata = 'true' } -Method Get
-                            `$companionToken = `$companionTokenResponse.access_token
-                            if ([string]::IsNullOrWhiteSpace(`$companionToken)) {
-                                throw 'Failed to acquire Managed Identity token for companion config download.'
-                            }
+                            `$companionToken = Get-MiAccessToken -Resource 'https://storage.azure.com/'
                             `$companionHeaders = @{
                                 Authorization  = "Bearer `$companionToken"
                                 'x-ms-version' = '2020-04-08'
@@ -581,6 +573,13 @@ configuration $configName {
     }
 }
 "@
+
+# Inject the MI token helper AFTER here-string expansion so the helper's own '$'
+# tokens are preserved literally (never interpolated by this build-time script).
+if ($configurationScript -notmatch '#__MI_HELPER__#') {
+    throw "Internal error: the '#__MI_HELPER__#' placeholder is missing from the DSC configuration template."
+}
+$configurationScript = $configurationScript.Replace('#__MI_HELPER__#', $miHelperBody)
 
 # Write the DSC configuration script to a private temp file and dot-source it
 # instead of using Invoke-Expression. Dot-sourcing defines the 'configuration'
