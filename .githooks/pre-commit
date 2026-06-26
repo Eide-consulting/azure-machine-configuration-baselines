@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+#
+# Pre-commit hook for this repository.
+#
+# Delegates to scripts/hooks/Invoke-PreCommit.ps1, which runs PowerShell linting,
+# manifest validation, the signature-staleness guard, and Pester tests.
+#
+# Activated via: git config core.hooksPath .githooks
+# Bypass intentionally with: git commit --no-verify
+
+if ! command -v pwsh >/dev/null 2>&1; then
+    echo "pre-commit: PowerShell 7+ (pwsh) is required but was not found on PATH." >&2
+    echo "pre-commit: install it or bypass with 'git commit --no-verify'." >&2
+    exit 1
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+pwsh -NoProfile -File "$repo_root/scripts/hooks/Invoke-PreCommit.ps1"

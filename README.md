@@ -17,6 +17,7 @@ Framework for deploying and maintaining Windows application baselines with Azure
 - .github/workflows/build-and-publish-package.yml: Build and publish package pipeline.
 - .github/workflows/get-policy-values.yml: Generate policy payload values from a published package.
 - docs/DEPLOYMENT.md: Step-by-step setup and execution.
+- .githooks/pre-commit and scripts/hooks/Invoke-PreCommit.ps1: Local pre-commit checks (lint, manifest validation, signature-staleness guard, tests). See [Development](#development).
 
 ## Quick Start
 
@@ -45,3 +46,50 @@ For the complete and approved onboarding flow (allowlist update, manifest update
 - Build And Publish uploads the package and stores `contentHash` metadata used by policy deployment.
 - Get Policy Values generates a ready-to-use policy payload based on the published package.
 - Assignment resource name can be descriptive (for example, Install-7zip), but guestConfiguration.name must match the package/MOF name.
+
+## Development
+
+### Pre-commit hooks
+
+This repo ships a version-controlled pre-commit hook that runs fast, mostly-offline checks before each commit. The checks live in `scripts/hooks/Invoke-PreCommit.ps1` and are dispatched by `.githooks/pre-commit`.
+
+What runs on commit:
+
+- **PSScriptAnalyzer** lint on staged `*.ps1` files (blocks the commit on `Error`-severity findings; warnings are reported but non-blocking).
+- **Validate-Manifest.ps1** structural + SHA256 checks when `manifests/software.manifest.json` is staged (no Azure, no secrets required).
+- **Signature-staleness guard**: if a signed control file (`manifests/software.manifest.json` or `scripts/installers/package-allowlist.json`) is staged, its companion `.sig` must also exist and be staged in the same commit. This enforces a re-sign after every change to a signed control file.
+- **Verify-Manifest.ps1** signature verification, run only when the public key is provided through the `MANIFEST_SIGNING_PUBLIC_KEY_PEM` environment variable.
+- **Pester** tests, run when any `*.Tests.ps1` files exist in the repo.
+
+The security-critical checks (manifest validation and the signature-staleness guard) use only built-in PowerShell and always run. The tooling checks (PSScriptAnalyzer, Pester) warn and skip when the module is not installed, rather than hard-blocking.
+
+#### One-time setup
+
+Each clone activates the hook locally (this is not done automatically by Git):
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Verify it is set (should print `.githooks`):
+
+```bash
+git config core.hooksPath
+```
+
+Install the optional analysis modules (PowerShell 7+):
+
+```powershell
+Install-Module PSScriptAnalyzer -Scope CurrentUser
+Install-Module Pester -Scope CurrentUser -SkipPublisherCheck
+```
+
+#### Bypassing
+
+For an intentional exception (for example, a docs-only commit), skip the hook with:
+
+```bash
+git commit --no-verify
+```
+
+To disable the hook for this clone, run `git config --unset core.hooksPath`.
