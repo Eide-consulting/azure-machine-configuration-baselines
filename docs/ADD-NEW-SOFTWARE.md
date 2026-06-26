@@ -9,7 +9,7 @@ The onboarding flow has two signed control points:
 - `scripts/installers/package-allowlist.json`: controls which application names are approved for packaging (`allowedPackages`).
 - `manifests/software.manifest.json`: defines installer metadata used by CI/package generation.
 
-Both files must be signed after edits.
+Both files must be signed after edits. The local pre-commit hook enforces this: if either control file is staged without a co-staged, up-to-date `.sig`, the commit is blocked. See the [Development](../README.md#development) section for hook setup.
 
 ## Prerequisites
 
