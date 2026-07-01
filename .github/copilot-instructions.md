@@ -107,3 +107,6 @@ Roll out by Azure Policy assignment scope (canary resource group → subscriptio
 
 ### Searching for content in files
 Use built-in workspace search and direct file reads to gather the line references, rather than relying on external tools that may not be available in all environments (e.g. `jq`, `yq`).
+
+### Scratch files and temporary artifacts
+Do not write scratch files (e.g. issue bodies, generated reports) to `/tmp`. Use the agent's session workspace instead (e.g. `~/.copilot/session-state/<session-id>/files/`) so artifacts stay isolated per session and don't leak across sessions/users on a shared machine.
