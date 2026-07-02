@@ -26,6 +26,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Azure login
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 #v3.0.0
@@ -63,17 +65,20 @@ jobs:
 
       - name: Validate manifest structure
         shell: pwsh
+        env:
+          MANIFEST_PATH: ${{ steps.select_manifest.outputs.manifest_source }}
         run: |
-          ./scripts/Validate-Manifest.ps1 -ManifestPath "${{ steps.select_manifest.outputs.manifest_source }}"
+          ./scripts/Validate-Manifest.ps1 -ManifestPath $env:MANIFEST_PATH
 
       - name: Verify manifest signature
         shell: pwsh
         env:
+          MANIFEST_PATH: ${{ steps.select_manifest.outputs.manifest_source }}
           MANIFEST_SIGNING_PUBLIC_KEY_PEM: ${{ secrets.MANIFEST_SIGNING_PUBLIC_KEY_PEM }}
         run: |
           $publicKey = ConvertTo-SecureString -String $env:MANIFEST_SIGNING_PUBLIC_KEY_PEM -AsPlainText -Force
           ./scripts/signing/Verify-Manifest.ps1 `
-            -ManifestPath "${{ steps.select_manifest.outputs.manifest_source }}" `
+            -ManifestPath $env:MANIFEST_PATH `
             -PublicKeyPem $publicKey
 
       - name: Verify allowlist signature
@@ -93,8 +98,9 @@ jobs:
         env:
           INPUT_APP_NAME: ${{ inputs.applicationName }}
           INPUT_APP_VERSION: ${{ inputs.applicationVersion }}
+          MANIFEST_PATH: ${{ steps.select_manifest.outputs.manifest_source }}
         run: |
-          $manifestPath = "${{ steps.select_manifest.outputs.manifest_source }}"
+          $manifestPath = $env:MANIFEST_PATH
           $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
 
           $appName = $env:INPUT_APP_NAME
@@ -198,6 +204,8 @@ jobs:
         env:
           INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
           INPUT_INSTALLER_CONTAINER: ${{ env.INSTALLER_CONTAINER_NAME }}
+          MANIFEST_PATH: ${{ steps.select_manifest.outputs.manifest_source }}
+          RUNNER_IPV4: ${{ steps.runner_ip.outputs.runner_ipv4 }}
         run: |
           $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
           $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(10).ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -211,7 +219,7 @@ jobs:
             --start $startTime `
             --expiry $expiryTime `
             --https-only `
-            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --ip $env:RUNNER_IPV4 `
             --output tsv
 
           $installerReadSas = [string]$installerReadSas
@@ -224,7 +232,7 @@ jobs:
           $installerReadSasSecure = ConvertTo-SecureString -String $installerReadSas -AsPlainText -Force
 
           ./scripts/Validate-Manifest.ps1 `
-            -ManifestPath "${{ steps.select_manifest.outputs.manifest_source }}" `
+            -ManifestPath $env:MANIFEST_PATH `
             -StorageAccountName $env:INPUT_STORAGE_ACCOUNT `
             -ContainerName $env:INPUT_INSTALLER_CONTAINER `
             -AuthMode sas `
@@ -239,8 +247,9 @@ jobs:
         env:
           INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
           INPUT_INSTALLER_CONTAINER: ${{ env.INSTALLER_CONTAINER_NAME }}
+          INSTALLER_BLOB_PATH: ${{ steps.resolve_app.outputs.installer_blob_path }}
         run: |
-          $installerUri = "https://$($env:INPUT_STORAGE_ACCOUNT).blob.core.windows.net/$($env:INPUT_INSTALLER_CONTAINER)/${{ steps.resolve_app.outputs.installer_blob_path }}"
+          $installerUri = "https://$($env:INPUT_STORAGE_ACCOUNT).blob.core.windows.net/$($env:INPUT_INSTALLER_CONTAINER)/$($env:INSTALLER_BLOB_PATH)"
           "installer_uri=$installerUri" >> $env:GITHUB_OUTPUT
 
       - name: Build Machine Configuration package
@@ -250,29 +259,39 @@ jobs:
         # broken MOF content.
         shell: powershell
         id: build_package
+        env:
+          INSTALLER_ARGS_B64: ${{ steps.resolve_app.outputs.installer_args_b64 }}
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          APP_VERSION: ${{ steps.resolve_app.outputs.app_version }}
+          INSTALLER_URI: ${{ steps.installer_sas.outputs.installer_uri }}
+          INSTALLER_SHA256: ${{ steps.resolve_app.outputs.installer_sha256 }}
+          PACKAGE_TYPE: ${{ steps.resolve_app.outputs.package_type }}
+          CONFIG_SHA256: ${{ steps.resolve_app.outputs.config_sha256 }}
+          VERIFY_PATH: ${{ steps.resolve_app.outputs.verify_path }}
+          REBOOT_REQUIRED: ${{ steps.resolve_app.outputs.reboot_required }}
         run: |
-          $installerArgsJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("${{ steps.resolve_app.outputs.installer_args_b64 }}"))
+          $installerArgsJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:INSTALLER_ARGS_B64))
           $installerArgs = $installerArgsJson | ConvertFrom-Json
 
           $packageParams = @{
-            ApplicationName = "${{ steps.resolve_app.outputs.app_name }}"
-            ApplicationVersion = "${{ steps.resolve_app.outputs.app_version }}"
-            InstallerPath = "${{ steps.installer_sas.outputs.installer_uri }}"
-            InstallerSha256 = "${{ steps.resolve_app.outputs.installer_sha256 }}"
-            InstallerType = "${{ steps.resolve_app.outputs.package_type }}"
+            ApplicationName = $env:APP_NAME
+            ApplicationVersion = $env:APP_VERSION
+            InstallerPath = $env:INSTALLER_URI
+            InstallerSha256 = $env:INSTALLER_SHA256
+            InstallerType = $env:PACKAGE_TYPE
             InstallerArgs = $installerArgs
             AllowlistPreVerified = $true
           }
 
-          if (-not [string]::IsNullOrWhiteSpace("${{ steps.resolve_app.outputs.config_sha256 }}")) {
-            $packageParams.ConfigSha256 = "${{ steps.resolve_app.outputs.config_sha256 }}"
+          if (-not [string]::IsNullOrWhiteSpace($env:CONFIG_SHA256)) {
+            $packageParams.ConfigSha256 = $env:CONFIG_SHA256
           }
 
-          if (-not [string]::IsNullOrWhiteSpace("${{ steps.resolve_app.outputs.verify_path }}")) {
-            $packageParams.VerifyPath = "${{ steps.resolve_app.outputs.verify_path }}"
+          if (-not [string]::IsNullOrWhiteSpace($env:VERIFY_PATH)) {
+            $packageParams.VerifyPath = $env:VERIFY_PATH
           }
 
-          if ('${{ steps.resolve_app.outputs.reboot_required }}' -eq 'True') {
+          if ($env:REBOOT_REQUIRED -eq 'True') {
             $packageParams.RebootRequired = $true
           }
 
@@ -296,8 +315,10 @@ jobs:
 
       - name: Validate package structure and contents
         shell: pwsh
+        env:
+          PACKAGE_PATH: ${{ steps.build_package.outputs.package_path }}
         run: |
-          $packagePath = "${{ steps.build_package.outputs.package_path }}"
+          $packagePath = $env:PACKAGE_PATH
           $packageDir = Split-Path -Path $packagePath -Parent
 
           Write-Host "=== Package Structure ==="
@@ -356,6 +377,13 @@ jobs:
         env:
           INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
           INPUT_BLOB_CONTAINER: ${{ env.BLOB_CONTAINER_NAME }}
+          RUNNER_IPV4: ${{ steps.runner_ip.outputs.runner_ipv4 }}
+          PACKAGE_PATH: ${{ steps.build_package.outputs.package_path }}
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          APP_VERSION: ${{ steps.resolve_app.outputs.app_version }}
+          CONTENT_HASH: ${{ steps.build_package.outputs.content_hash }}
+          PACKAGE_NAME: ${{ steps.build_package.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.build_package.outputs.package_version }}
         run: |
           $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
           $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(15).ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -369,7 +397,7 @@ jobs:
             --start $startTime `
             --expiry $expiryTime `
             --https-only `
-            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --ip $env:RUNNER_IPV4 `
             --output tsv
 
           $packageUploadSas = [string]$packageUploadSas
@@ -381,17 +409,17 @@ jobs:
 
           $env:AZURE_STORAGE_SAS_TOKEN = $packageUploadSas
 
-          $packageFile = Split-Path -Path "${{ steps.build_package.outputs.package_path }}" -Leaf
-          $blobPath = "packages/${{ steps.resolve_app.outputs.app_name }}/${{ steps.resolve_app.outputs.app_version }}/$packageFile"
+          $packageFile = Split-Path -Path $env:PACKAGE_PATH -Leaf
+          $blobPath = "packages/$($env:APP_NAME)/$($env:APP_VERSION)/$packageFile"
 
           try {
             az storage blob upload `
               --account-name $env:INPUT_STORAGE_ACCOUNT `
               --container-name $env:INPUT_BLOB_CONTAINER `
               --name "$blobPath" `
-              --file "${{ steps.build_package.outputs.package_path }}" `
+              --file $env:PACKAGE_PATH `
               --overwrite true `
-              --metadata contentHash="${{ steps.build_package.outputs.content_hash }}" packageName="${{ steps.build_package.outputs.package_name }}" packageVersion="${{ steps.build_package.outputs.package_version }}" `
+              --metadata contentHash="$env:CONTENT_HASH" packageName="$env:PACKAGE_NAME" packageVersion="$env:PACKAGE_VERSION" `
               --output none
           }
           finally {
@@ -410,17 +438,23 @@ jobs:
       - name: Write job summary
         if: success()
         shell: pwsh
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          APP_VERSION: ${{ steps.resolve_app.outputs.app_version }}
+          PACKAGE_NAME: ${{ steps.build_package.outputs.package_name }}
+          CONTENT_HASH: ${{ steps.build_package.outputs.content_hash }}
+          BLOB_PATH: ${{ steps.upload_package.outputs.blob_path }}
         run: |
           $summary = @"
           ## Package Published
 
           | Field          | Value |
           |----------------|-------|
-          | Application    | ${{ steps.resolve_app.outputs.app_name }} |
-          | Version        | ${{ steps.resolve_app.outputs.app_version }} |
-          | Package name   | ${{ steps.build_package.outputs.package_name }} |
-          | Content hash   | ${{ steps.build_package.outputs.content_hash }} |
-          | Blob path      | ${{ steps.upload_package.outputs.blob_path }} |
+          | Application    | $($env:APP_NAME) |
+          | Version        | $($env:APP_VERSION) |
+          | Package name   | $($env:PACKAGE_NAME) |
+          | Content hash   | $($env:CONTENT_HASH) |
+          | Blob path      | $($env:BLOB_PATH) |
 
           The package is published. Run the **Get Policy Values** workflow to generate the Azure Policy definition, then deploy it with Azure Policy.
           "@
