@@ -25,6 +25,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 #v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Azure login
         uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43 #v3.0.0
@@ -55,8 +57,9 @@ jobs:
         env:
           INPUT_APP_NAME: ${{ inputs.applicationName }}
           INPUT_APP_VERSION: ${{ inputs.applicationVersion }}
+          MANIFEST_PATH: ${{ steps.select_manifest.outputs.manifest_source }}
         run: |
-          $manifestPath = "${{ steps.select_manifest.outputs.manifest_source }}"
+          $manifestPath = $env:MANIFEST_PATH
           $manifest = Get-Content -Path $manifestPath -Raw | ConvertFrom-Json
 
           $appName = $env:INPUT_APP_NAME
@@ -121,9 +124,12 @@ jobs:
         env:
           INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
           INPUT_BLOB_CONTAINER: ${{ env.BLOB_CONTAINER_NAME }}
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          APP_VERSION: ${{ steps.resolve_app.outputs.app_version }}
+          RUNNER_IPV4: ${{ steps.runner_ip.outputs.runner_ipv4 }}
         run: |
-          $appName = "${{ steps.resolve_app.outputs.app_name }}"
-          $appVersion = "${{ steps.resolve_app.outputs.app_version }}"
+          $appName = $env:APP_NAME
+          $appVersion = $env:APP_VERSION
           $blobName = "packages/$appName/$appVersion/mc-$appName.zip"
 
           $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -139,7 +145,7 @@ jobs:
             --start $startTime `
             --expiry $expiryTime `
             --https-only `
-            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --ip $env:RUNNER_IPV4 `
             --output tsv
 
           $blobReadSas = [string]$blobReadSas
@@ -202,12 +208,15 @@ jobs:
         env:
           INPUT_STORAGE_ACCOUNT: ${{ env.STORAGE_ACCOUNT_NAME }}
           INPUT_BLOB_CONTAINER: ${{ env.BLOB_CONTAINER_NAME }}
+          BLOB_NAME: ${{ steps.policy_values.outputs.blob_name }}
+          PACKAGE_NAME: ${{ steps.policy_values.outputs.package_name }}
+          RUNNER_IPV4: ${{ steps.runner_ip.outputs.runner_ipv4 }}
         run: |
           # This workflow does not build or publish packages.
           # It only downloads the already-published package so New-GuestConfigurationPolicy
           # can generate a policy JSON configured for system-assigned managed identity.
-          $blobName = "${{ steps.policy_values.outputs.blob_name }}"
-          $packagePath = Join-Path $env:RUNNER_TEMP "${{ steps.policy_values.outputs.package_name }}.zip"
+          $blobName = $env:BLOB_NAME
+          $packagePath = Join-Path $env:RUNNER_TEMP "$($env:PACKAGE_NAME).zip"
 
           $startTime = (Get-Date).ToUniversalTime().AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ssZ')
           $expiryTime = (Get-Date).ToUniversalTime().AddMinutes(10).ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -222,7 +231,7 @@ jobs:
             --start $startTime `
             --expiry $expiryTime `
             --https-only `
-            --ip "${{ steps.runner_ip.outputs.runner_ipv4 }}" `
+            --ip $env:RUNNER_IPV4 `
             --output tsv
 
           $blobReadSas = [string]$blobReadSas
@@ -256,11 +265,16 @@ jobs:
       - name: Generate ready-to-use policy JSON
         id: generate_policy
         shell: powershell
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          APP_VERSION: ${{ steps.resolve_app.outputs.app_version }}
+          CONTENT_URI: ${{ steps.policy_values.outputs.content_uri }}
+          LOCAL_PACKAGE_PATH: ${{ steps.download_package.outputs.package_path }}
         run: |
-          $appName    = "${{ steps.resolve_app.outputs.app_name }}"
-          $appVersion = "${{ steps.resolve_app.outputs.app_version }}"
-          $contentUri = "${{ steps.policy_values.outputs.content_uri }}"
-          $localPackagePath = "${{ steps.download_package.outputs.package_path }}"
+          $appName = $env:APP_NAME
+          $appVersion = $env:APP_VERSION
+          $contentUri = $env:CONTENT_URI
+          $localPackagePath = $env:LOCAL_PACKAGE_PATH
 
           Import-Module GuestConfiguration -ErrorAction Stop
 
@@ -364,9 +378,14 @@ jobs:
 
       - name: Write job summary
         shell: pwsh
+        env:
+          APP_NAME: ${{ steps.resolve_app.outputs.app_name }}
+          APP_VERSION: ${{ steps.resolve_app.outputs.app_version }}
         run: |
+          $policyDefinitionName = "Install-$($env:APP_NAME)"
+          $policyFileName = "$($env:APP_NAME)-machine-configuration-policy.json"
           $summary = @"
-          ## Policy JSON for ${{ steps.resolve_app.outputs.app_name }} ${{ steps.resolve_app.outputs.app_version }}
+          ## Policy JSON for $($env:APP_NAME) $($env:APP_VERSION)
 
           A ready-to-use policy JSON configured for **system-assigned managed identity** package download has been uploaded as a workflow artifact.
           This workflow does **not** build or publish packages; it only generates policy JSON from a package already published by the Build And Publish workflow.
@@ -377,8 +396,8 @@ jobs:
           ``````powershell
           az rest \`
             --method put \`
-            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/Install-${{ steps.resolve_app.outputs.app_name }}?api-version=2021-06-01" \`
-            --body @${{ steps.resolve_app.outputs.app_name }}-machine-configuration-policy.json \`
+            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" \`
+            --body @$policyFileName \`
             --headers "Content-Type=application/json"
           ``````
           "@
