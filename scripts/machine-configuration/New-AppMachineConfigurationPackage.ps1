@@ -44,7 +44,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-. (Join-Path -Path $PSScriptRoot -ChildPath '../lib/Test-DetachedSignature.ps1')
+$detachedSignatureHelperPath = Join-Path -Path $PSScriptRoot -ChildPath '../lib/Test-DetachedSignature.ps1'
+if (-not (Test-Path -Path $detachedSignatureHelperPath)) {
+    throw "Detached signature helper not found at '$detachedSignatureHelperPath'."
+}
+
+. $detachedSignatureHelperPath
 
 # PS7 strict mode: $null.Count throws whereas PS5.1 silently returns 0.
 # Normalise here so all subsequent code can safely use $InstallerArgs.Count.
