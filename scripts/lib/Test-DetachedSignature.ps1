@@ -71,11 +71,11 @@ function Test-DetachedSignature {
         $SignaturePath = "$resolvedTarget.sig"
     }
 
-    if (-not (Test-Path -Path $SignaturePath)) {
+    if (-not (Test-Path -LiteralPath $SignaturePath -PathType Leaf)) {
         throw "Signature file not found: '$SignaturePath'. Sign the file with Sign-Manifest.ps1 before deploying."
     }
 
-    $sigContent = Get-Content -Path $SignaturePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $sigContent = Get-Content -LiteralPath $SignaturePath -Raw -Encoding UTF8 | ConvertFrom-Json
 
     if ([string]$sigContent.algorithm -ne 'ECDSA-P256-SHA256') {
         throw "Signature file '$SignaturePath' algorithm '$($sigContent.algorithm)' is not supported. Expected 'ECDSA-P256-SHA256'."
