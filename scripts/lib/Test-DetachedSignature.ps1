@@ -61,7 +61,11 @@ function Test-DetachedSignature {
         [string]$ExpectedKeyId
     )
 
-    $resolvedTarget = (Resolve-Path -Path $TargetPath).Path
+    if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
+        throw "Target file not found: '$TargetPath'."
+    }
+
+    $resolvedTarget = (Resolve-Path -LiteralPath $TargetPath -ErrorAction Stop).Path
 
     if ([string]::IsNullOrWhiteSpace($SignaturePath)) {
         $SignaturePath = "$resolvedTarget.sig"
