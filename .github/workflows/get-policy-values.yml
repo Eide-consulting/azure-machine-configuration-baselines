@@ -360,11 +360,35 @@ jobs:
             $policyPayload | Add-Member -NotePropertyName 'name' -NotePropertyValue $policyDefinitionName -Force
           }
 
+          # New-GuestConfigurationPolicy does not scope the assignment to tagged machines, so
+          # every eligible Windows VM/Arc machine would be targeted. Inject an explicit tag
+          # condition so the policy only applies to machines tagged
+          # MachineConfiguration=$appName, per the machine targeting contract in docs/DEPLOYMENT.md.
+          $policyRule = $policyPayload.properties.policyRule
+          if ($null -eq $policyRule) {
+            throw "Generated policy '$generatedPath' does not contain a policyRule."
+          }
+
+          $tagCondition = [pscustomobject]@{
+            field    = "tags['MachineConfiguration']"
+            contains = $appName
+          }
+
+          if ($null -ne $policyRule.if.PSObject.Properties['allOf']) {
+            $policyRule.if.allOf = @($policyRule.if.allOf) + $tagCondition
+          }
+          else {
+            $policyRule.if = [pscustomobject]@{ allOf = @($policyRule.if, $tagCondition) }
+          }
+
           $policyPayload | ConvertTo-Json -Depth 50 | Set-Content -Path $outputPath -Encoding UTF8
 
           $policyJson = Get-Content -Path $outputPath -Raw
           if ($policyJson -notmatch '"contentManagedIdentity"') {
             throw "Generated policy '$outputPath' does not include guestConfiguration.contentManagedIdentity."
+          }
+          if ($policyJson -notmatch [regex]::Escape("tags['MachineConfiguration']")) {
+            throw "Generated policy '$outputPath' is missing MachineConfiguration tag scoping."
           }
 
           "output_path=$outputPath" >> $env:GITHUB_OUTPUT
