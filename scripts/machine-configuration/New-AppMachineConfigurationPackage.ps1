@@ -49,6 +49,7 @@ if (-not (Test-Path -Path $detachedSignatureHelperPath)) {
     throw "Detached signature helper not found at '$detachedSignatureHelperPath'."
 }
 
+$detachedSignatureHelperPath = (Resolve-Path -Path $detachedSignatureHelperPath -ErrorAction Stop).Path
 . $detachedSignatureHelperPath
 
 # PS7 strict mode: $null.Count throws whereas PS5.1 silently returns 0.
@@ -142,21 +143,24 @@ if ($AllowlistPreVerified -and $null -ne $AllowlistPublicKeyPem) {
 }
 
 $allowlistPath = Join-Path -Path $PSScriptRoot -ChildPath '../installers/package-allowlist.json'
-if (Test-Path -Path $allowlistPath) {
-    if ($null -ne $AllowlistPublicKeyPem) {
-        Confirm-AllowlistSignature -AllowlistPath $allowlistPath -PublicKeyPem $AllowlistPublicKeyPem
-    }
-    elseif ($AllowlistPreVerified) {
-        Write-Host "Allowlist signature pre-verified by a prior pipeline step; skipping inline ECDSA check."
-    }
-    else {
-        throw "Allowlist integrity verification is required. Pass -AllowlistPublicKeyPem (inline verification) or -AllowlistPreVerified (when a prior step has already verified the signature)."
-    }
-    $allowlist = Get-Content -Path $allowlistPath -Raw | ConvertFrom-Json
-    $allowedNames = @($allowlist.allowedPackages) | ForEach-Object { $_.ToLowerInvariant() }
-    if ($ApplicationName.ToLowerInvariant() -notin $allowedNames) {
-        throw "Application '$ApplicationName' is not in the installer allowlist. Add it to scripts/installers/package-allowlist.json after review."
-    }
+if (-not (Test-Path -Path $allowlistPath)) {
+    throw "Installer allowlist not found: '$allowlistPath'. Refusing to package without scripts/installers/package-allowlist.json."
+}
+
+if ($null -ne $AllowlistPublicKeyPem) {
+    Confirm-AllowlistSignature -AllowlistPath $allowlistPath -PublicKeyPem $AllowlistPublicKeyPem
+}
+elseif ($AllowlistPreVerified) {
+    Write-Host "Allowlist signature pre-verified by a prior pipeline step; skipping inline ECDSA check."
+}
+else {
+    throw "Allowlist integrity verification is required. Pass -AllowlistPublicKeyPem (inline verification) or -AllowlistPreVerified (when a prior step has already verified the signature)."
+}
+
+$allowlist = Get-Content -Path $allowlistPath -Raw | ConvertFrom-Json
+$allowedNames = @($allowlist.allowedPackages) | ForEach-Object { $_.ToLowerInvariant() }
+if ($ApplicationName.ToLowerInvariant() -notin $allowedNames) {
+    throw "Application '$ApplicationName' is not in the installer allowlist. Add it to scripts/installers/package-allowlist.json after review."
 }
 
 # Validate every installer argument: only safe characters, no whitespace (spaces would allow argument injection).

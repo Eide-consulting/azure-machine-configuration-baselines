@@ -55,6 +55,7 @@ if (-not (Test-Path -Path $detachedSignatureHelperPath)) {
     throw "Detached signature helper not found at '$detachedSignatureHelperPath'."
 }
 
+$detachedSignatureHelperPath = (Resolve-Path -Path $detachedSignatureHelperPath -ErrorAction Stop).Path
 . $detachedSignatureHelperPath
 
 $resolvedManifest = (Resolve-Path -Path $ManifestPath).Path

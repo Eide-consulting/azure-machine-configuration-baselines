@@ -82,6 +82,14 @@ Describe 'Test-DetachedSignature' {
             Should -Throw '*tampered*'
     }
 
+    It 'throws a path-specific error when the target file is not valid JSON' {
+        $targetPath = New-SignedFixture -Name 'malformed-target'
+        Set-Content -Path $targetPath -Value 'not valid json' -Encoding UTF8
+
+        { Test-DetachedSignature -TargetPath $targetPath -PublicKeyPem (Get-PublicKeySecure) } |
+            Should -Throw "Target file is not valid JSON: '$targetPath'."
+    }
+
     It 'throws when the signature file is missing' {
         $targetPath = Join-Path -Path $TestDrive -ChildPath 'nosig.json'
         @{ name = 'nosig'; version = '1.0.0' } | ConvertTo-Json | Set-Content -Path $targetPath -Encoding UTF8

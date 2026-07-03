@@ -97,10 +97,15 @@ function Test-DetachedSignature {
         throw "Signature file '$SignaturePath' does not contain a valid Base64 ECDSA signature."
     }
 
-    # Recompute over canonical JSON (same logic as Sign-Manifest.ps1).
-    $targetContent = Get-Content -Path $resolvedTarget -Raw -Encoding UTF8
-    $targetObj = $targetContent | ConvertFrom-Json
-    $canonicalJson = $targetObj | ConvertTo-Json -Depth 10 -Compress
+    try {
+        # Recompute over canonical JSON (same logic as Sign-Manifest.ps1).
+        $targetContent = Get-Content -Path $resolvedTarget -Raw -Encoding UTF8
+        $targetObj = $targetContent | ConvertFrom-Json
+        $canonicalJson = $targetObj | ConvertTo-Json -Depth 10 -Compress
+    }
+    catch {
+        throw "Target file is not valid JSON: '$resolvedTarget'."
+    }
 
     $contentBytes = [System.Text.Encoding]::UTF8.GetBytes($canonicalJson)
 
