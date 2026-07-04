@@ -434,12 +434,21 @@ jobs:
           The artifact contains the **full ARM policy definition envelope** ready for `az rest`.
           Download it from the **Artifacts** section above and use it when creating or updating your policy definition.
 
-          To apply the policy definition via CLI:
+          To apply the policy definition via CLI (bash/zsh):
+          ``````bash
+          az rest \
+            --method put \
+            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" \
+            --body @$policyFileName \
+            --headers "Content-Type=application/json"
+          ``````
+
+          To apply the policy definition via CLI (PowerShell / pwsh):
           ``````powershell
-          az rest \`
-            --method put \`
-            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" \`
-            --body @$policyFileName \`
+          az rest ``
+            --method put ``
+            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" ``
+            --body @$policyFileName ``
             --headers "Content-Type=application/json"
           ``````
           "@
