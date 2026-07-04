@@ -305,6 +305,11 @@ jobs:
             PolicyVersion = '1.0.0'
             Mode = 'ApplyAndAutoCorrect'
             LocalContentPath = $localPackagePath
+            # Scopes the generated policy to only machines tagged
+            # MachineConfiguration=<appName>, per the machine targeting contract in
+            # docs/DEPLOYMENT.md. Without this, the policy would apply to every eligible
+            # Windows VM/Arc machine in scope.
+            Tag = @{ MachineConfiguration = $appName }
           }
 
           New-GuestConfigurationPolicy @policyParams -UseSystemAssignedIdentity | Out-Null
@@ -360,26 +365,29 @@ jobs:
             $policyPayload | Add-Member -NotePropertyName 'name' -NotePropertyValue $policyDefinitionName -Force
           }
 
-          # New-GuestConfigurationPolicy does not scope the assignment to tagged machines, so
-          # every eligible Windows VM/Arc machine would be targeted. Inject an explicit tag
-          # condition so the policy only applies to machines tagged
-          # MachineConfiguration=$appName, per the machine targeting contract in docs/DEPLOYMENT.md.
-          $policyRule = $policyPayload.properties.policyRule
-          if ($null -eq $policyRule) {
-            throw "Generated policy '$generatedPath' does not contain a policyRule."
+          # The -Tag parameter above makes New-GuestConfigurationPolicy inject a
+          # tags['MachineConfiguration'] condition using the "equals" operator. Rewrite it to
+          # "contains" so the policy also matches machines with multiple comma-separated
+          # MachineConfiguration tag values, per the machine targeting contract in
+          # docs/DEPLOYMENT.md.
+          $policyIf = $policyPayload.properties.policyRule.if
+          $tagConditionNode = $null
+          if ($null -ne $policyIf.PSObject.Properties['allOf']) {
+            $tagConditionNode = @($policyIf.allOf) | Where-Object { $_.field -eq "tags['MachineConfiguration']" } | Select-Object -First 1
+          }
+          elseif ($policyIf.field -eq "tags['MachineConfiguration']") {
+            $tagConditionNode = $policyIf
           }
 
-          $tagCondition = [pscustomobject]@{
-            field    = "tags['MachineConfiguration']"
-            contains = $appName
+          if ($null -eq $tagConditionNode) {
+            throw "Generated policy '$generatedPath' does not contain the expected MachineConfiguration tag condition from the -Tag parameter."
           }
 
-          if ($null -ne $policyRule.if.PSObject.Properties['allOf']) {
-            $policyRule.if.allOf = @($policyRule.if.allOf) + $tagCondition
+          $tagValue = $tagConditionNode.equals
+          if ($null -ne $tagConditionNode.PSObject.Properties['equals']) {
+            $tagConditionNode.PSObject.Properties.Remove('equals')
           }
-          else {
-            $policyRule.if = [pscustomobject]@{ allOf = @($policyRule.if, $tagCondition) }
-          }
+          $tagConditionNode | Add-Member -NotePropertyName 'contains' -NotePropertyValue $tagValue -Force
 
           $policyPayload | ConvertTo-Json -Depth 50 | Set-Content -Path $outputPath -Encoding UTF8
 
@@ -387,8 +395,18 @@ jobs:
           if ($policyJson -notmatch '"contentManagedIdentity"') {
             throw "Generated policy '$outputPath' does not include guestConfiguration.contentManagedIdentity."
           }
-          if ($policyJson -notmatch [regex]::Escape("tags['MachineConfiguration']")) {
-            throw "Generated policy '$outputPath' is missing MachineConfiguration tag scoping."
+
+          $finalDoc = Get-Content -Path $outputPath -Raw | ConvertFrom-Json
+          $finalIf = $finalDoc.properties.policyRule.if
+          $finalTagNode = $null
+          if ($null -ne $finalIf.PSObject.Properties['allOf']) {
+            $finalTagNode = @($finalIf.allOf) | Where-Object { $_.field -eq "tags['MachineConfiguration']" } | Select-Object -First 1
+          }
+          elseif ($finalIf.field -eq "tags['MachineConfiguration']") {
+            $finalTagNode = $finalIf
+          }
+          if ($null -eq $finalTagNode -or $null -eq $finalTagNode.PSObject.Properties['contains'] -or $finalTagNode.contains -ne $appName) {
+            throw "Generated policy '$outputPath' is missing a 'contains' MachineConfiguration tag scoping condition for '$appName'."
           }
 
           "output_path=$outputPath" >> $env:GITHUB_OUTPUT
