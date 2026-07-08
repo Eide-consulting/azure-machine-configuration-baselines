@@ -305,6 +305,11 @@ jobs:
             PolicyVersion = '1.0.0'
             Mode = 'ApplyAndAutoCorrect'
             LocalContentPath = $localPackagePath
+            # Scopes the generated policy to only machines tagged
+            # MachineConfiguration=<appName>, per the machine targeting contract in
+            # docs/DEPLOYMENT.md. Without this, the policy would apply to every eligible
+            # Windows VM/Arc machine in scope.
+            Tag = @{ MachineConfiguration = $appName }
           }
 
           New-GuestConfigurationPolicy @policyParams -UseSystemAssignedIdentity | Out-Null
@@ -360,11 +365,48 @@ jobs:
             $policyPayload | Add-Member -NotePropertyName 'name' -NotePropertyValue $policyDefinitionName -Force
           }
 
+          # The -Tag parameter above makes New-GuestConfigurationPolicy inject a
+          # tags['MachineConfiguration'] condition using the "equals" operator. Rewrite it to
+          # "contains" so the policy also matches machines with multiple comma-separated
+          # MachineConfiguration tag values, per the machine targeting contract in
+          # docs/DEPLOYMENT.md.
+          $policyIf = $policyPayload.properties.policyRule.if
+          $tagConditionNode = $null
+          if ($null -ne $policyIf.PSObject.Properties['allOf']) {
+            $tagConditionNode = @($policyIf.allOf) | Where-Object { $_.field -eq "tags['MachineConfiguration']" } | Select-Object -First 1
+          }
+          elseif ($policyIf.field -eq "tags['MachineConfiguration']") {
+            $tagConditionNode = $policyIf
+          }
+
+          if ($null -eq $tagConditionNode) {
+            throw "Generated policy '$generatedPath' does not contain the expected MachineConfiguration tag condition from the -Tag parameter."
+          }
+
+          $tagValue = $tagConditionNode.equals
+          if ($null -ne $tagConditionNode.PSObject.Properties['equals']) {
+            $tagConditionNode.PSObject.Properties.Remove('equals')
+          }
+          $tagConditionNode | Add-Member -NotePropertyName 'contains' -NotePropertyValue $tagValue -Force
+
           $policyPayload | ConvertTo-Json -Depth 50 | Set-Content -Path $outputPath -Encoding UTF8
 
           $policyJson = Get-Content -Path $outputPath -Raw
           if ($policyJson -notmatch '"contentManagedIdentity"') {
             throw "Generated policy '$outputPath' does not include guestConfiguration.contentManagedIdentity."
+          }
+
+          $finalDoc = Get-Content -Path $outputPath -Raw | ConvertFrom-Json
+          $finalIf = $finalDoc.properties.policyRule.if
+          $finalTagNode = $null
+          if ($null -ne $finalIf.PSObject.Properties['allOf']) {
+            $finalTagNode = @($finalIf.allOf) | Where-Object { $_.field -eq "tags['MachineConfiguration']" } | Select-Object -First 1
+          }
+          elseif ($finalIf.field -eq "tags['MachineConfiguration']") {
+            $finalTagNode = $finalIf
+          }
+          if ($null -eq $finalTagNode -or $null -eq $finalTagNode.PSObject.Properties['contains'] -or $finalTagNode.contains -ne $appName) {
+            throw "Generated policy '$outputPath' is missing a 'contains' MachineConfiguration tag scoping condition for '$appName'."
           }
 
           "output_path=$outputPath" >> $env:GITHUB_OUTPUT
@@ -392,12 +434,21 @@ jobs:
           The artifact contains the **full ARM policy definition envelope** ready for `az rest`.
           Download it from the **Artifacts** section above and use it when creating or updating your policy definition.
 
-          To apply the policy definition via CLI:
+          To apply the policy definition via CLI (bash/zsh):
+          ``````bash
+          az rest \
+            --method put \
+            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" \
+            --body @$policyFileName \
+            --headers "Content-Type=application/json"
+          ``````
+
+          To apply the policy definition via CLI (PowerShell / pwsh):
           ``````powershell
-          az rest \`
-            --method put \`
-            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" \`
-            --body @$policyFileName \`
+          az rest ``
+            --method put ``
+            --uri "https://management.azure.com/providers/Microsoft.Management/managementGroups/<management-group>/providers/Microsoft.Authorization/policyDefinitions/$policyDefinitionName?api-version=2021-06-01" ``
+            --body @$policyFileName ``
             --headers "Content-Type=application/json"
           ``````
           "@

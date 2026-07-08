@@ -44,6 +44,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+$detachedSignatureHelperPath = Join-Path -Path $PSScriptRoot -ChildPath '../lib/Test-DetachedSignature.ps1'
+if (-not (Test-Path -Path $detachedSignatureHelperPath)) {
+    throw "Detached signature helper not found at '$detachedSignatureHelperPath'."
+}
+
+$detachedSignatureHelperPath = (Resolve-Path -Path $detachedSignatureHelperPath -ErrorAction Stop).Path
+. $detachedSignatureHelperPath
+
 # PS7 strict mode: $null.Count throws whereas PS5.1 silently returns 0.
 # Normalise here so all subsequent code can safely use $InstallerArgs.Count.
 if ($null -eq $InstallerArgs) { $InstallerArgs = [string[]]@() }
@@ -99,68 +107,7 @@ function Confirm-AllowlistSignature {
         [SecureString]$PublicKeyPem
     )
 
-    $sigPath = "$AllowlistPath.sig"
-    if (-not (Test-Path -Path $sigPath)) {
-        throw "Allowlist signature file not found: '$sigPath'. Sign the allowlist with Sign-Manifest.ps1 before deploying."
-    }
-
-    $credential = [System.Net.NetworkCredential]::new('', $PublicKeyPem)
-    try {
-        $publicKeyText = $credential.Password
-        if ([string]::IsNullOrWhiteSpace($publicKeyText)) {
-            throw 'AllowlistPublicKeyPem is empty.'
-        }
-    }
-    finally {
-        $credential.Password = [string]::Empty
-    }
-
-    $sigContent = Get-Content -Path $sigPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ([string]$sigContent.algorithm -ne 'ECDSA-P256-SHA256') {
-        throw "Allowlist signature file '$sigPath' algorithm '$($sigContent.algorithm)' is not supported. Expected 'ECDSA-P256-SHA256'."
-    }
-
-    if ([string]$sigContent.manifest -ne (Split-Path -Path $AllowlistPath -Leaf)) {
-        throw "Allowlist signature file '$sigPath' manifest field '$([string]$sigContent.manifest)' does not match target allowlist path '$AllowlistPath'."
-    }
-
-    $storedSig = [string]$sigContent.signature
-    if ([string]::IsNullOrWhiteSpace($storedSig)) {
-        throw "Allowlist signature file '$sigPath' does not contain a signature value."
-    }
-
-    try {
-        $signatureBytes = [Convert]::FromBase64String($storedSig)
-    }
-    catch {
-        throw "Allowlist signature file '$sigPath' does not contain a valid Base64 ECDSA signature."
-    }
-
-    $allowlistContent = Get-Content -Path $AllowlistPath -Raw -Encoding UTF8
-    $allowlistObj = $allowlistContent | ConvertFrom-Json
-    $canonicalJson = $allowlistObj | ConvertTo-Json -Depth 10 -Compress
-    $contentBytes = [System.Text.Encoding]::UTF8.GetBytes($canonicalJson)
-
-    $ecdsa = [System.Security.Cryptography.ECDsa]::Create()
-    if (-not ($ecdsa | Get-Member -Name 'ImportFromPem' -MemberType Method)) {
-        throw 'Current PowerShell runtime does not support ECDSA ImportFromPem. Use PowerShell 7+ on .NET that supports ImportFromPem.'
-    }
-
-    $ecdsa.ImportFromPem($publicKeyText.ToCharArray())
-    try {
-        $isValid = $ecdsa.VerifyData(
-            $contentBytes,
-            $signatureBytes,
-            [System.Security.Cryptography.HashAlgorithmName]::SHA256
-        )
-    }
-    finally {
-        $ecdsa.Dispose()
-    }
-
-    if (-not $isValid) {
-        throw "Allowlist signature verification FAILED for '$AllowlistPath'. The allowlist may have been tampered with."
-    }
+    Test-DetachedSignature -TargetPath $AllowlistPath -PublicKeyPem $PublicKeyPem | Out-Null
 
     Write-Host "Allowlist signature verified OK: '$AllowlistPath'"
 }
@@ -196,21 +143,24 @@ if ($AllowlistPreVerified -and $null -ne $AllowlistPublicKeyPem) {
 }
 
 $allowlistPath = Join-Path -Path $PSScriptRoot -ChildPath '../installers/package-allowlist.json'
-if (Test-Path -Path $allowlistPath) {
-    if ($null -ne $AllowlistPublicKeyPem) {
-        Confirm-AllowlistSignature -AllowlistPath $allowlistPath -PublicKeyPem $AllowlistPublicKeyPem
-    }
-    elseif ($AllowlistPreVerified) {
-        Write-Host "Allowlist signature pre-verified by a prior pipeline step; skipping inline ECDSA check."
-    }
-    else {
-        throw "Allowlist integrity verification is required. Pass -AllowlistPublicKeyPem (inline verification) or -AllowlistPreVerified (when a prior step has already verified the signature)."
-    }
-    $allowlist = Get-Content -Path $allowlistPath -Raw | ConvertFrom-Json
-    $allowedNames = @($allowlist.allowedPackages) | ForEach-Object { $_.ToLowerInvariant() }
-    if ($ApplicationName.ToLowerInvariant() -notin $allowedNames) {
-        throw "Application '$ApplicationName' is not in the installer allowlist. Add it to scripts/installers/package-allowlist.json after review."
-    }
+if (-not (Test-Path -Path $allowlistPath)) {
+    throw "Installer allowlist not found: '$allowlistPath'. Refusing to package without scripts/installers/package-allowlist.json."
+}
+
+if ($null -ne $AllowlistPublicKeyPem) {
+    Confirm-AllowlistSignature -AllowlistPath $allowlistPath -PublicKeyPem $AllowlistPublicKeyPem
+}
+elseif ($AllowlistPreVerified) {
+    Write-Host "Allowlist signature pre-verified by a prior pipeline step; skipping inline ECDSA check."
+}
+else {
+    throw "Allowlist integrity verification is required. Pass -AllowlistPublicKeyPem (inline verification) or -AllowlistPreVerified (when a prior step has already verified the signature)."
+}
+
+$allowlist = Get-Content -Path $allowlistPath -Raw | ConvertFrom-Json
+$allowedNames = @($allowlist.allowedPackages) | ForEach-Object { $_.ToLowerInvariant() }
+if ($ApplicationName.ToLowerInvariant() -notin $allowedNames) {
+    throw "Application '$ApplicationName' is not in the installer allowlist. Add it to scripts/installers/package-allowlist.json after review."
 }
 
 # Validate every installer argument: only safe characters, no whitespace (spaces would allow argument injection).

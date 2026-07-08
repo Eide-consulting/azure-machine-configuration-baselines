@@ -182,6 +182,26 @@ az policy assignment create \
   --scope /subscriptions/<SUBSCRIPTION_ID>/resourceGroups/<RESOURCE_GROUP>
 ```
 
+### Creating the definition in the Azure Portal
+
+The generated `<app-name>-machine-configuration-policy.json` artifact is the **full ARM REST envelope** — a top-level `properties` object plus a `name`. That shape is correct **only** for a raw REST `PUT` (the `az rest` command above).
+
+The portal's policy-definition editor and other tooling (`az policy definition create`, `New-AzPolicyDefinition`) wrap what you give them inside their own `properties`. Pasting the full envelope there produces a doubly-nested body and fails with:
+
+```text
+The request content was invalid and could not be deserialized:
+'Could not find member 'properties' on object of type 'PolicyDefinitionProperties'.
+Path 'properties.properties' ...'
+```
+
+To import in the portal, paste **only the value of the `properties` key** (drop the outer `properties` wrapper and the `name`). The portal supplies the `name` and the `properties` wrapper itself. Extract the inner object with:
+
+```bash
+jq .properties <app-name>-machine-configuration-policy.json > <app-name>-policy-portal-paste.json
+```
+
+If the portal rejects `displayName`, `policyType`, `description`, or `metadata` (these can be set through the portal form fields), keep only `mode`, `parameters`, and `policyRule` in the paste.
+
 ## 7. Scale Strategy For Hundreds Of Machines
 
 - Use separate policy assignments for rollout rings (canary, pilot, broad).
