@@ -13,3 +13,6 @@
 
 # complete policies
 complete-policies/
+
+#temporary files
+*.temp
